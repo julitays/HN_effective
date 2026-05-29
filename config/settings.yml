@@ -1,0 +1,26 @@
+paths:
+  raw: data/raw
+  out: data/out
+
+sources:
+  oed:
+    folder: data/raw/oed
+    output: data/out/oed_fact.parquet
+  okk:
+    folder: data/raw/okk
+    output: data/out/okk_fact.parquet
+  learning:
+    folder: data/raw/learning
+    output: data/out/learning_fact.parquet
+  kpi:
+    folder: data/raw/kpi
+    output: data/out/kpi_fact.parquet
+  users:
+    folder: data/raw/users
+    output: data/out/users.parquet
+  enps:
+    folder: data/raw/enps
+    output: data/out/enps_fact.parquet
+  attestations:
+    folder: data/raw/attestations
+    output: data/out/attestations_fact.parquet

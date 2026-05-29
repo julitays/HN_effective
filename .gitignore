@@ -1,0 +1,33 @@
+# Virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Pytest
+.pytest_cache/
+
+# Data files (raw sources and output — not tracked in git)
+data/raw/**
+data/out/**
+
+# Keep folder structure in git
+!data/raw/.gitkeep
+!data/raw/oed/.gitkeep
+!data/raw/okk/.gitkeep
+!data/raw/learning/.gitkeep
+!data/raw/kpi/.gitkeep
+!data/raw/users/.gitkeep
+!data/raw/enps/.gitkeep
+!data/raw/attestations/.gitkeep
+!data/out/.gitkeep
+
+# Power BI
+*.pbix
+
+# OS
+.DS_Store
+Thumbs.db
