@@ -15,18 +15,22 @@ data/raw/**
 data/out/**
 
 # Keep folder structure in git
+# (нужно сначала "открыть" сами подпапки, иначе git не спустится внутрь
+# них, чтобы применить !.../.gitkeep — иначе негейт ниже не срабатывает)
 !data/raw/.gitkeep
-!data/raw/oed/.gitkeep
-!data/raw/okk/.gitkeep
-!data/raw/learning/.gitkeep
-!data/raw/kpi/.gitkeep
-!data/raw/users/.gitkeep
-!data/raw/enps/.gitkeep
-!data/raw/attestations/.gitkeep
+!data/raw/*/
+!data/raw/*/.gitkeep
 !data/out/.gitkeep
 
 # Power BI
 *.pbix
+/tmp_pbix_unpack/
+
+# Случайные экспорты/архивы в корне проекта (не путать с config/*.xlsx —
+# те легитимные и трекаются намеренно)
+/*.xlsx
+/*.csv
+/*.zip
 
 # OS
 .DS_Store
