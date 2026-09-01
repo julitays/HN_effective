@@ -10,14 +10,21 @@ from scripts.utils import load_settings, save_parquet, extract_sv_code as _extra
 from scripts.staffing_utils import (
     attach_last_quarter_metric as _attach_last_quarter_metric,
     build_enps_quarterly as _build_enps_quarterly,
+    is_tm_role,
+    mode_or_first,
+    normalize_confirmed_tm,
 )
+from scripts.kpi_metric_utils import KPI_COMPONENT_COLUMNS
+from scripts.kpi_org_mapping import build_rtm_month_org
 
 
-REPORT_START_YEAR = load_settings()["reporting"]["start_yearmonth"] // 100
+SETTINGS = load_settings()
+REPORT_START_YEAR = SETTINGS["reporting"]["start_yearmonth"] // 100
+PAGE2_RULES = SETTINGS["business_rules"]["page2"]
 
-TARGET_KPI = 0.75
+TARGET_KPI = float(PAGE2_RULES["kpi_red_min"])
 TARGET_OKK = 0.60
-TARGET_LEARN = 0.75
+TARGET_LEARN = float(PAGE2_RULES["learning_red_min"])
 TARGET_FRAUD = 0.10
 TARGET_RISK = 0.16
 
@@ -27,6 +34,8 @@ TARGET_COMPLEX_STORES_SHARE = 0.15
 COMPLEX_OSA_MIN = 0.80
 COMPLEX_PICOS_MIN = 0.80
 COMPLEX_OKK_MIN = 0.55
+NO_TM_ID = "NO_TM"
+NO_TM_NAME = "Вакансия / нет ТМ"
 
 
 def _coerce_numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
@@ -47,29 +56,38 @@ def _build_region_monthly_base(
     kpi_work = kpi.copy()
     if "Вакансия" in kpi_work.columns:
         kpi_work = kpi_work[kpi_work["Вакансия"] != True].copy()
+    allowed_months = set(pd.to_datetime(okk["MonthStart"], errors="coerce").dropna().unique())
     if kpi_tt_direct is not None and not kpi_tt_direct.empty:
-        allowed_months = set(pd.to_datetime(kpi_tt_direct["MonthStart"], errors="coerce").dropna().unique())
-    else:
-        allowed_months = set(pd.to_datetime(kpi_work["MonthStart"], errors="coerce").dropna().unique())
+        allowed_months |= set(
+            pd.to_datetime(kpi_tt_direct["MonthStart"], errors="coerce").dropna().unique()
+        )
     okk = okk[okk["MonthStart"].isin(allowed_months)].copy()
     learning_monthly = learning_monthly[learning_monthly["MonthStart"].isin(allowed_months)].copy()
 
     if kpi_tt_direct is not None and not kpi_tt_direct.empty:
         kpi_tt_direct = kpi_tt_direct[kpi_tt_direct["Регион BI"].notna()].copy()
+        kpi_aggregations = {"KPI проекта %": ("KPI проекта %", "mean")}
+        kpi_aggregations.update(
+            {
+                column: (column, "mean")
+                for column in KPI_COMPONENT_COLUMNS
+                if column in kpi_tt_direct.columns
+            }
+        )
         kpi_monthly = (
             kpi_tt_direct.groupby(["MonthStart", "YearMonth", "Регион BI"], dropna=False)
-            .agg(**{"KPI проекта %": ("KPI 1", "mean")})
+            .agg(**kpi_aggregations)
             .reset_index()
         )
     else:
-        kpi_monthly = (
-            kpi_work.groupby(["MonthStart", "YearMonth", "Регион BI"], dropna=False)
-            .agg(
-                **{
-                    "KPI проекта %": ("KPI 1", "mean"),
-                }
-            )
-            .reset_index()
+        kpi_monthly = pd.DataFrame(
+            columns=[
+                "MonthStart",
+                "YearMonth",
+                "Регион BI",
+                "KPI проекта %",
+                *KPI_COMPONENT_COLUMNS,
+            ]
         )
 
     okk_monthly = (
@@ -131,12 +149,13 @@ def _build_region_monthly_base(
         .merge(learn_monthly, on=["MonthStart", "YearMonth", "Регион BI"], how="left")
     )
 
-    base = _attach_last_quarter_metric(base, enps_quarterly, "Риск ухода региона %")
+    base = _attach_last_quarter_metric(base, enps_quarterly, "Риск ухода региона %", period="year")
     base["Доля сложных ТТ %"] = base["Сложных ТТ"] / base["ТТ всего"]
     base = _coerce_numeric_columns(
         base,
         [
             "KPI проекта %",
+            *KPI_COMPONENT_COLUMNS,
             "OSA %",
             "PICOS %",
             "ОКК %",
@@ -162,7 +181,7 @@ def _format_pp(value: float | None) -> str:
     if pd.isna(value):
         return "—"
     sign = "+" if value >= 0 else ""
-    return f"{sign}{value * 100:.1f} п.п."
+    return f"{sign}{value * 100:.1f}%"
 
 
 def _format_count(value: float | None) -> str:
@@ -173,7 +192,7 @@ def _format_count(value: float | None) -> str:
 
 def _action_impact_label(value_pp: float) -> str:
     sign = "+" if value_pp >= 0 else ""
-    return f"{sign}{value_pp:.1f} п.п. KPI"
+    return f"{sign}{value_pp:.1f}% KPI"
 
 
 def _worst_regions_text(
@@ -214,8 +233,6 @@ def _build_actions_monthly(
         overall = {
             "MonthStart": month_start,
             "YearMonth": month_df["YearMonth"].dropna().iloc[0] if month_df["YearMonth"].notna().any() else pd.NA,
-            "OSA %": month_okk["% наличия товара на полке"].mean(),
-            "PICOS %": month_okk["% наличия PICoS"].mean(),
             "Фрод %": month_okk["Флаг фальсификации"].mean(),
             "Фрод кол-во": int(month_okk["Флаг фальсификации"].fillna(False).eq(True).sum()),
             "Обучение %": (
@@ -226,6 +243,14 @@ def _build_actions_monthly(
             "Сложных ТТ": month_df["Сложных ТТ"].sum(),
             "ТТ всего": month_df["ТТ всего"].sum(),
         }
+        for metric in ("PICOS", "OSA", "TOP16"):
+            for value in ("план %", "факт %", "выполнение %"):
+                column = f"{metric} {value}"
+                overall[column] = (
+                    pd.to_numeric(month_df[column], errors="coerce").mean()
+                    if column in month_df.columns
+                    else pd.NA
+                )
         overall["Доля сложных ТТ %"] = overall["Сложных ТТ"] / overall["ТТ всего"] if overall["ТТ всего"] else pd.NA
 
         current_complex_share = overall["Доля сложных ТТ %"]
@@ -236,30 +261,46 @@ def _build_actions_monthly(
         )
 
         actions = [
+            *[
+                {
+                    "Порядок действия": order,
+                    "Что сделать": action_name,
+                    "Метрика": metric,
+                    "Сейчас значение": overall[f"{metric} факт %"],
+                    "Цель значение": overall[f"{metric} план %"],
+                    "Выполнение значение": overall[f"{metric} выполнение %"],
+                    "Разрыв значение": (
+                        max(0.0, overall[f"{metric} план %"] - overall[f"{metric} факт %"])
+                        if pd.notna(overall[f"{metric} план %"])
+                        and pd.notna(overall[f"{metric} факт %"])
+                        else pd.NA
+                    ),
+                    "Оценка влияния значение": (
+                        max(0.0, overall[f"{metric} план %"] - overall[f"{metric} факт %"])
+                        * weight
+                        * 100
+                        if pd.notna(overall[f"{metric} план %"])
+                        and pd.notna(overall[f"{metric} факт %"])
+                        else 0.0
+                    ),
+                    "Ответственный контур": "СВ / ТТ",
+                    "Фокус": _worst_regions_text(
+                        month_df,
+                        f"{metric} факт %",
+                        overall[f"{metric} план %"],
+                        "low",
+                    )
+                    if pd.notna(overall[f"{metric} план %"])
+                    else "данных пока недостаточно",
+                }
+                for order, metric, action_name, weight in [
+                    (1, "PICOS", "Устранить просадку PICOS", 1.0),
+                    (2, "OSA", "Подтянуть OSA", 0.5),
+                    (3, "TOP16", "Подтянуть TOP16", 0.5),
+                ]
+            ],
             {
-                "Порядок действия": 1,
-                "Что сделать": "Подтянуть OSA",
-                "Метрика": "OSA %",
-                "Сейчас значение": overall["OSA %"],
-                "Цель значение": TARGET_OSA,
-                "Разрыв значение": max(0.0, TARGET_OSA - overall["OSA %"]) if pd.notna(overall["OSA %"]) else pd.NA,
-                "Оценка влияния значение": max(0.0, (TARGET_OSA - overall["OSA %"]) * 24) if pd.notna(overall["OSA %"]) else 0.0,
-                "Ответственный контур": "СВ / ТТ",
-                "Фокус": _worst_regions_text(month_df, "OSA %", TARGET_OSA, "low"),
-            },
-            {
-                "Порядок действия": 2,
-                "Что сделать": "Устранить просадку PICOS",
-                "Метрика": "PICOS %",
-                "Сейчас значение": overall["PICOS %"],
-                "Цель значение": TARGET_PICOS,
-                "Разрыв значение": max(0.0, TARGET_PICOS - overall["PICOS %"]) if pd.notna(overall["PICOS %"]) else pd.NA,
-                "Оценка влияния значение": max(0.0, (TARGET_PICOS - overall["PICOS %"]) * 21) if pd.notna(overall["PICOS %"]) else 0.0,
-                "Ответственный контур": "СВ / МЕ",
-                "Фокус": _worst_regions_text(month_df, "PICOS %", TARGET_PICOS, "low"),
-            },
-            {
-                "Порядок действия": 3,
+                "Порядок действия": 4,
                 "Что сделать": "Снизить фрод",
                 "Метрика": "Фрод %",
                 "Сейчас значение": overall["Фрод %"],
@@ -270,7 +311,7 @@ def _build_actions_monthly(
                 "Фокус": _worst_regions_text(month_df, "Фрод %", TARGET_FRAUD, "high"),
             },
             {
-                "Порядок действия": 4,
+                "Порядок действия": 5,
                 "Что сделать": "Разобрать сложные ТТ",
                 "Метрика": "Сложных ТТ",
                 "Сейчас значение": current_complex_count,
@@ -281,7 +322,7 @@ def _build_actions_monthly(
                 "Фокус": _worst_regions_text(month_df, "Доля сложных ТТ %", TARGET_COMPLEX_STORES_SHARE, "high"),
             },
             {
-                "Порядок действия": 5,
+                "Порядок действия": 6,
                 "Что сделать": "Подтянуть обучение",
                 "Метрика": "Обучение %",
                 "Сейчас значение": overall["Обучение %"],
@@ -308,6 +349,7 @@ def _build_actions_monthly(
                 action["Сейчас"] = _format_pct(current_value)
                 action["Цель"] = _format_pct(target_value)
                 action["Разрыв"] = _format_pp(gap_value)
+            action["Выполнение"] = _format_pct(action.get("Выполнение значение"))
 
             action["Оценка влияния"] = _action_impact_label(impact_value)
             action["MonthStart"] = overall["MonthStart"]
@@ -325,14 +367,19 @@ def _build_actions_monthly(
         for rank, row in enumerate(actionable_rows, start=1):
             row["Порядок действия"] = rank
             row["ДБ заголовок"] = row["Что сделать"]
-            if row["Метрика"] == "OSA %":
+            if row["Метрика"] == "OSA":
                 row["ДБ текст"] = (
-                    f"OSA {row['Сейчас']} при цели {row['Цель']}; "
+                    f"OSA: факт {row['Сейчас']}, план {row['Цель']}, выполнение {row['Выполнение']}; "
                     f"основная просадка — {row['Фокус']}."
                 )
-            elif row["Метрика"] == "PICOS %":
+            elif row["Метрика"] == "PICOS":
                 row["ДБ текст"] = (
-                    f"PICOS {row['Сейчас']} при цели {row['Цель']}; "
+                    f"PICOS: факт {row['Сейчас']}, план {row['Цель']}, выполнение {row['Выполнение']}; "
+                    f"слабые зоны — {row['Фокус']}."
+                )
+            elif row["Метрика"] == "TOP16":
+                row["ДБ текст"] = (
+                    f"TOP16: факт {row['Сейчас']}, план {row['Цель']}, выполнение {row['Выполнение']}; "
                     f"слабые зоны — {row['Фокус']}."
                 )
             elif row["Метрика"] == "Фрод %":
@@ -422,6 +469,16 @@ def _build_supervisor_directory(kpi: pd.DataFrame, teams: pd.DataFrame, dim_empl
     for column in ["ID супервайзера", "ID территориального менеджера", "Супервайзер", "Территориальный менеджер", "Регион BI", "Группа региона"]:
         if column in teams_work.columns:
             teams_work[column] = teams_work[column].replace("", pd.NA)
+    tm_dim = dim_employees.copy()
+    if {"Активен", "Должность"}.issubset(tm_dim.columns):
+        tm_dim = tm_dim[tm_dim["Активен"].fillna(False).eq(True) & tm_dim["Должность"].map(is_tm_role)].copy()
+    else:
+        tm_dim = tm_dim[tm_dim["Должность"].map(is_tm_role)].copy()
+    valid_tm_ids = set(tm_dim["ID сотрудника"].dropna().astype(str).str.strip()) if "ID сотрудника" in tm_dim.columns else set()
+    tm_ids = teams_work["ID территориального менеджера"].astype("string").str.strip()
+    invalid_tm = tm_ids.notna() & ~tm_ids.isin(valid_tm_ids)
+    teams_work.loc[invalid_tm, "ID территориального менеджера"] = pd.NA
+    teams_work.loc[invalid_tm, "Территориальный менеджер"] = pd.NA
 
     teams_dir = (
         teams_work.dropna(subset=["ID супервайзера"])
@@ -448,7 +505,7 @@ def _build_supervisor_directory(kpi: pd.DataFrame, teams: pd.DataFrame, dim_empl
     else:
         sv_dim = dim[dim["Должность"].astype(str).str.lower().str.contains("супервайзер", na=False)].copy()
     tm_lookup = (
-        dim[["ID сотрудника", "ФИО", "Регион BI", "Группа региона"]]
+        tm_dim[["ID сотрудника", "ФИО", "Регион BI", "Группа региона"]]
         .dropna(subset=["ID сотрудника"])
         .drop_duplicates("ID сотрудника")
         .rename(
@@ -493,6 +550,11 @@ def _build_supervisor_directory(kpi: pd.DataFrame, teams: pd.DataFrame, dim_empl
     directory["Территориальный менеджер"] = directory["Территориальный менеджер"].combine_first(
         directory.get("Территориальный менеджер dim")
     )
+    tm_ids = directory["ID территориального менеджера"].astype("string").str.strip()
+    invalid_tm = tm_ids.notna() & ~tm_ids.isin(valid_tm_ids) & tm_ids.ne(NO_TM_ID)
+    directory.loc[invalid_tm, "ID территориального менеджера"] = pd.NA
+    directory.loc[invalid_tm, "Территориальный менеджер"] = pd.NA
+    directory = normalize_confirmed_tm(directory)
     directory["Регион BI"] = (
         directory["Регион BI"]
         .combine_first(directory.get("Регион BI dim"))
@@ -553,12 +615,24 @@ def _build_sv_monthly_snapshot(
         .agg(
             **{
                 "Супервайзер": ("Супервайзер", "first"),
-                "KPI проекта %": ("KPI 1", "mean"),
+                "Регион BI": ("Регион BI", mode_or_first),
+                "ID территориального менеджера": ("ID территориального менеджера", mode_or_first),
+                "Территориальный менеджер": ("Территориальный менеджер", mode_or_first),
+                "Количество ТМ по RTM": ("Территориальный менеджер", "nunique"),
+                "KPI проекта %": ("KPI проекта %", "mean"),
                 "Код маршрута СВ": ("Код маршрута СВ", "first"),
+                **{
+                    column: (column, "mean")
+                    for column in KPI_COMPONENT_COLUMNS
+                    if column in kpi_work.columns
+                },
             }
         )
         .reset_index()
     )
+    multiple_tm = kpi_sv["Количество ТМ по RTM"].gt(1)
+    kpi_sv.loc[multiple_tm, "ID территориального менеджера"] = pd.NA
+    kpi_sv.loc[multiple_tm, "Территориальный менеджер"] = pd.NA
 
     okk_sv = (
         okk.groupby(
@@ -615,13 +689,17 @@ def _build_sv_monthly_snapshot(
     sv_base = sv_base[sv_base["ID супервайзера"].astype(str).isin(active_sv_ids)].copy()
     sv_base["Супервайзер"] = sv_base["Супервайзер_dir"].combine_first(sv_base["Супервайзер"])
     if "Территориальный менеджер_dir" in sv_base.columns:
-        sv_base["Территориальный менеджер"] = sv_base["Территориальный менеджер_dir"]
+        sv_base["Территориальный менеджер"] = sv_base["Территориальный менеджер_dir"].combine_first(
+            sv_base.get("Территориальный менеджер")
+        )
     if "Регион BI_dir" in sv_base.columns:
-        sv_base["Регион BI"] = sv_base["Регион BI_dir"]
+        sv_base["Регион BI"] = sv_base["Регион BI_dir"].combine_first(sv_base["Регион BI"])
     if "Группа региона_dir" in sv_base.columns:
         sv_base["Группа региона"] = sv_base["Группа региона_dir"]
     if "ID территориального менеджера_dir" in sv_base.columns:
-        sv_base["ID территориального менеджера"] = sv_base["ID территориального менеджера_dir"]
+        sv_base["ID территориального менеджера"] = sv_base["ID территориального менеджера_dir"].combine_first(
+            sv_base.get("ID территориального менеджера")
+        )
     sv_base = sv_base.drop(
         columns=[
             "Супервайзер_dir",
@@ -632,15 +710,17 @@ def _build_sv_monthly_snapshot(
         ],
         errors="ignore",
     )
+    sv_base = normalize_confirmed_tm(sv_base)
 
     enps_quarterly = _build_enps_quarterly(enps)
-    sv_base = _attach_last_quarter_metric(sv_base, enps_quarterly, "Риск ухода региона %")
+    sv_base = _attach_last_quarter_metric(
+        sv_base, enps_quarterly, "Риск ухода региона %", period="year"
+    )
     sv_base = _coerce_numeric_columns(
         sv_base,
         [
             "KPI проекта %",
-            "OSA %",
-            "PICOS %",
+            *KPI_COMPONENT_COLUMNS,
             "ОКК %",
             "Обучение %",
             "Фрод %",
@@ -658,8 +738,9 @@ def _build_sv_monthly_snapshot(
             "Разобрать KPI": max(0.0, TARGET_KPI - row["KPI проекта %"]) if pd.notna(row.get("KPI проекта %")) else 0.0,
             "Снизить фрод": max(0.0, row["Фрод %"] - TARGET_FRAUD) if pd.notna(row.get("Фрод %")) else 0.0,
             "Подтянуть ОКК": max(0.0, TARGET_OKK - row["ОКК %"]) if pd.notna(row.get("ОКК %")) else 0.0,
-            "Подтянуть OSA": max(0.0, TARGET_OSA - row["OSA %"]) if pd.notna(row.get("OSA %")) else 0.0,
-            "Устранить просадку PICOS": max(0.0, TARGET_PICOS - row["PICOS %"]) if pd.notna(row.get("PICOS %")) else 0.0,
+            "Подтянуть OSA": max(0.0, 1.0 - row["OSA выполнение %"]) if pd.notna(row.get("OSA выполнение %")) else 0.0,
+            "Устранить просадку PICOS": max(0.0, 1.0 - row["PICOS выполнение %"]) if pd.notna(row.get("PICOS выполнение %")) else 0.0,
+            "Подтянуть TOP16": max(0.0, 1.0 - row["TOP16 выполнение %"]) if pd.notna(row.get("TOP16 выполнение %")) else 0.0,
             "Подтянуть обучение": max(0.0, TARGET_LEARN - row["Обучение %"]) if pd.notna(row.get("Обучение %")) else 0.0,
         }
 
@@ -671,6 +752,7 @@ def _build_sv_monthly_snapshot(
             "Подтянуть ОКК",
             "Подтянуть OSA",
             "Устранить просадку PICOS",
+            "Подтянуть TOP16",
             "Подтянуть обучение",
         ]
         active = [name for name in action_priority if gaps.get(name, 0) > 0]
@@ -688,9 +770,11 @@ def _build_sv_monthly_snapshot(
         if gaps["Подтянуть ОКК"] > 0:
             reasons.append(f"ОКК {_format_pct(row['ОКК %'])}")
         if gaps["Подтянуть OSA"] > 0:
-            reasons.append(f"OSA {_format_pct(row['OSA %'])}")
+            reasons.append(f"OSA {_format_pct(row['OSA выполнение %'])}")
         if gaps["Устранить просадку PICOS"] > 0:
-            reasons.append(f"PICOS {_format_pct(row['PICOS %'])}")
+            reasons.append(f"PICOS {_format_pct(row['PICOS выполнение %'])}")
+        if gaps["Подтянуть TOP16"] > 0:
+            reasons.append(f"TOP16 {_format_pct(row['TOP16 выполнение %'])}")
         if gaps["Подтянуть обучение"] > 0:
             reasons.append(f"обучение {_format_pct(row['Обучение %'])}")
 
@@ -733,8 +817,7 @@ def _build_sv_monthly_snapshot(
         "Код СВ",
         "СВ / Объект",
         "KPI проекта %",
-        "OSA %",
-        "PICOS %",
+        *KPI_COMPONENT_COLUMNS,
         "ОКК %",
         "Обучение %",
         "Фрод %",
@@ -765,6 +848,38 @@ def build_page2_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     region_base = _build_region_monthly_base(kpi, okk, learning_monthly, enps, kpi_tt_direct=kpi_tt_direct)
     actions = _build_actions_monthly(region_base, okk, learning_monthly)
     sv_snapshot = _build_sv_monthly_snapshot(kpi, okk, learning_fact, teams, enps, dim_employees)
+    rtm_path = out_dir / "rtm_employee_visits.parquet"
+    if rtm_path.exists():
+        source_org = build_rtm_month_org(pd.read_parquet(rtm_path), "ID супервайзера")
+        if not source_org.empty:
+            source_org = source_org.rename(
+                columns={
+                    "ID территориального менеджера": "ID территориального менеджера RTM",
+                    "Территориальный менеджер": "Территориальный менеджер RTM",
+                    "Регион BI": "Регион BI RTM",
+                }
+            )
+            sv_snapshot = sv_snapshot.merge(
+                source_org,
+                on=["MonthStart", "YearMonth", "ID супервайзера"],
+                how="left",
+            )
+            tm_ids = sv_snapshot["ID территориального менеджера"].astype("string").str.strip()
+            missing_tm = tm_ids.isna() | tm_ids.eq("")
+            source_available = sv_snapshot["ID территориального менеджера RTM"].notna()
+            source_fill = missing_tm & source_available
+            sv_snapshot.loc[source_fill, "ID территориального менеджера"] = sv_snapshot.loc[
+                source_fill, "ID территориального менеджера RTM"
+            ]
+            sv_snapshot.loc[source_fill, "Территориальный менеджер"] = sv_snapshot.loc[
+                source_fill, "Территориальный менеджер RTM"
+            ]
+            sv_snapshot["Регион BI"] = sv_snapshot["Регион BI"].combine_first(sv_snapshot["Регион BI RTM"])
+            sv_snapshot = normalize_confirmed_tm(sv_snapshot)
+            sv_snapshot = sv_snapshot.drop(
+                columns=["ID территориального менеджера RTM", "Территориальный менеджер RTM", "Регион BI RTM"],
+                errors="ignore",
+            )
 
     save_parquet(actions, str(out_dir / "page2_actions_monthly.parquet"))
     save_parquet(sv_snapshot, str(out_dir / "page2_sv_monthly_snapshot.parquet"))

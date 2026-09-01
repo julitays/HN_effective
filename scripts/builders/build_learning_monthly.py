@@ -56,7 +56,7 @@ def build_learning_monthly() -> pd.DataFrame:
     print(f"\n  Learning monthly: {len(monthly)} строк")
     print(
         "  Периоды: "
-        f"{monthly['MonthStart'].min():%Y-%m} → {monthly['MonthStart'].max():%Y-%m}"
+        f"{monthly['MonthStart'].min():%Y-%m} -> {monthly['MonthStart'].max():%Y-%m}"
         if not monthly.empty else "  Периоды: нет данных"
     )
     return monthly

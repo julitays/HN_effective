@@ -9,11 +9,13 @@ if __package__ is None or __package__ == "":
 
 from scripts.utils import (
     load_settings,
+    mean_numeric,
     save_parquet,
     normalize_pct as _normalize_pct,
     normalize_valid_pct as _normalize_valid_pct,
     normalize_person_name as _normalize_name,
 )
+from scripts.staffing_utils import normalize_confirmed_tm
 
 
 OED_PERSONAL_COMPONENTS = [
@@ -26,11 +28,6 @@ OED_PERSONAL_COMPONENTS = [
 
 NO_TM_ID = "NO_TM"
 NO_TM_NAME = "Вакансия / нет ТМ"
-
-
-def _mean_numeric(series: pd.Series):
-    numeric = pd.to_numeric(series, errors="coerce")
-    return numeric.mean() if numeric.notna().any() else pd.NA
 
 
 def _normalize_oed_role(role: str | None, position: str | None) -> str:
@@ -88,12 +85,8 @@ def _build_team_lookup(teams: pd.DataFrame, supervisors: pd.DataFrame, tms: pd.D
         ]
     ].dropna(subset=["ID мерчендайзера"]).copy()
     me_lookup = me_lookup.rename(columns={"ID мерчендайзера": "ID сотрудника"})
-    me_lookup["ID территориального менеджера"] = (
-        me_lookup["ID территориального менеджера"].replace("", pd.NA).fillna(NO_TM_ID)
-    )
-    me_lookup["Территориальный менеджер"] = (
-        me_lookup["Территориальный менеджер"].replace("", pd.NA).fillna(NO_TM_NAME)
-    )
+    me_lookup["ID территориального менеджера"] = me_lookup["ID территориального менеджера"].replace("", pd.NA)
+    me_lookup = normalize_confirmed_tm(me_lookup)
 
     sv_lookup = supervisors[
         [
@@ -109,12 +102,8 @@ def _build_team_lookup(teams: pd.DataFrame, supervisors: pd.DataFrame, tms: pd.D
     ].dropna(subset=["ID супервайзера"]).copy()
     sv_lookup = sv_lookup.rename(columns={"ID супервайзера": "ID сотрудника"})
     sv_lookup["ID супервайзера"] = sv_lookup["ID сотрудника"]
-    sv_lookup["ID территориального менеджера"] = (
-        sv_lookup["ID территориального менеджера"].replace("", pd.NA).fillna(NO_TM_ID)
-    )
-    sv_lookup["Территориальный менеджер"] = (
-        sv_lookup["Территориальный менеджер"].replace("", pd.NA).fillna(NO_TM_NAME)
-    )
+    sv_lookup["ID территориального менеджера"] = sv_lookup["ID территориального менеджера"].replace("", pd.NA)
+    sv_lookup = normalize_confirmed_tm(sv_lookup)
 
     tm_lookup = tms[
         [
@@ -148,9 +137,9 @@ def _build_sv_team_aggregates(oed: pd.DataFrame) -> pd.DataFrame:
         .agg(
             **{
                 "МЕ с ОЭД": ("ID сотрудника", "nunique"),
-                "Средний KPI ОЭД команды МЕ %": ("KPI ОЭД %", _mean_numeric),
-                "Средняя личная эффективность команды МЕ %": ("Личная эффективность ОЭД %", _mean_numeric),
-                "Средний рейтинг команды МЕ ОЭД": ("Рейтинг ОЭД", _mean_numeric),
+                "Средний KPI ОЭД команды МЕ %": ("KPI ОЭД %", mean_numeric),
+                "Средняя личная эффективность команды МЕ %": ("Личная эффективность ОЭД %", mean_numeric),
+                "Средний рейтинг команды МЕ ОЭД": ("Рейтинг ОЭД", mean_numeric),
                 "ТОП/Мастер в команде ОЭД": ("Класс ОЭД", lambda s: s.map(_class_group).isin(["ТОП", "Мастер"]).sum()),
                 "Требует развития в команде ОЭД": ("Класс ОЭД", lambda s: s.map(_class_group).eq("Требует развития").sum()),
             }

@@ -3,16 +3,16 @@ from pathlib import Path
 from scripts.utils import load_settings, save_parquet, normalize_dim
 
 
+NO_TM_ID = "NO_TM"
+NO_TM_NAME = "Вакансия / нет ТМ"
+
+
 def _detect_level(position: str, org_unit: str = "") -> str:
     pos = str(position).strip().lower()
-    org = str(org_unit).lower()
 
     if pos == "rm":
         return "RM"
-    if pos == "tm":
-        return "TM"
-    # Директор в полевом отделе без проекта = уровень TM
-    if "директор" in pos and "полевой" in org and "h&n" not in org:
+    if pos in {"tm", "тм", "территориальный менеджер"}:
         return "TM"
     if "супервайзер" in pos:
         return "SV"
@@ -27,13 +27,20 @@ def _resolve(eid: str, lookup: dict) -> dict:
     return lookup[eid]
 
 
+def _tm_assignment_for_sv(sv_row: dict, lookup: dict) -> tuple[str | None, str | None, str | None, str]:
+    tm_id = sv_row.get("manager_id", "")
+    tm_row = _resolve(tm_id, lookup)
+    if tm_row.get("level") == "TM":
+        rm_id = tm_row.get("manager_id", "")
+        rm_row = _resolve(rm_id, lookup)
+        return rm_id or None, rm_row.get("full_name"), tm_id or None, tm_row.get("full_name")
+    return None, None, NO_TM_ID, NO_TM_NAME
+
+
 def build_teams(dim: pd.DataFrame = None) -> pd.DataFrame:
     settings     = load_settings()
     teams_cfg    = settings["sources"].get("teams", {})
     output       = teams_cfg.get("output", "data/out/dim_teams.parquet")
-    vacant_tm_id = teams_cfg.get("vacant_tm_manager_id", "")
-    vacant_rm_id = teams_cfg.get("vacant_rm_manager_id", "")
-    rm_branch_id = teams_cfg.get("rm_branch_manager_id", "")
 
     if dim is None or dim.empty:
         dim_path = Path(settings["sources"]["users"]["output"])
@@ -59,52 +66,22 @@ def build_teams(dim: pd.DataFrame = None) -> pd.DataFrame:
     svs_with_merch = set(merch_df["manager_id"].dropna())
     empty_svs      = sv_df[~sv_df["employee_id"].isin(svs_with_merch)]
 
-    # Определяем уровень СВ (их TM — ТМ-тип или RM-тип?) по manager_id СВ
-    def _vacant_manager(sv_row: dict) -> tuple[str, str]:
-        """Возвращает (manager_id, manager_name) для вакантной позиции."""
-        sv_mgr_id = sv_row.get("manager_id", "")
-        # Определяем тип вакансии по тому, какого уровня был менеджер СВ
-        # (RM-ветка vs TM-ветка — id обеих сторон берём из settings.yml)
-        mgr_id = vacant_rm_id if sv_mgr_id == "Вакансия" and _is_rm_sv(sv_row) \
-                 else vacant_tm_id
-        mgr_row = _resolve(mgr_id, lookup)
-        return mgr_id or None, mgr_row.get("full_name")
-
-    def _is_rm_sv(sv_row: dict) -> bool:
-        """True если СВ находится в зоне ответственности RM-ветки."""
-        # СВ под RM: их менеджер (до вакансии) был RM-уровня.
-        # Определяем по manager_id == rm_branch_manager_id (settings.yml)
-        rm_svs_ids = {
-            row["employee_id"]
-            for _, row in dim[dim["level"] == "SV"].iterrows()
-            if row.get("manager_id") == rm_branch_id
-        }
-        return sv_row.get("employee_id") in rm_svs_ids
-
     rows = []
 
     # ── Строки от мерчендайзеров ─────────────────────────────────────────────
     for _, m in merch_df.iterrows():
         sv_row  = _resolve(m["manager_id"], lookup)
-        tm_id   = sv_row.get("manager_id", "")
-        tm_row  = _resolve(tm_id, lookup)
-        rm_id   = tm_row.get("manager_id", "")
-        rm_row  = _resolve(rm_id, lookup)
-
-        is_tm_vacant = (tm_id == "Вакансия")
-        if is_tm_vacant:
-            mgr_id, mgr_name = vacant_tm_id or None, _resolve(vacant_tm_id, lookup).get("full_name")
-        else:
-            mgr_id, mgr_name = (rm_id or None), rm_row.get("full_name")
+        mgr_id, mgr_name, tm_id, tm_name = _tm_assignment_for_sv(sv_row, lookup)
 
         rows.append({
             "manager_id":    mgr_id,
             "manager_name":  mgr_name,
-            "tm_id":         tm_id   or None,
-            "tm_name":       "Вакансия" if is_tm_vacant else tm_row.get("full_name"),
+            "tm_id":         tm_id,
+            "tm_name":       tm_name,
             "sv_id":         m["manager_id"] if m["manager_id"] in lookup else None,
             "sv_name":       sv_row.get("full_name"),
             "sv_city":       sv_row.get("city"),
+            "sv_route":      sv_row.get("attribute"),
             "employee_id":   m["employee_id"],
             "employee_name": m["full_name"],
             "position":      m["position"],
@@ -117,25 +94,17 @@ def build_teams(dim: pd.DataFrame = None) -> pd.DataFrame:
 
     # ── Строки для СВ без команды (пустые) ───────────────────────────────────
     for _, sv in empty_svs.iterrows():
-        tm_id  = sv["manager_id"]
-        tm_row = _resolve(tm_id, lookup)
-        rm_id  = tm_row.get("manager_id", "")
-        rm_row = _resolve(rm_id, lookup)
-
-        is_tm_vacant = (tm_id == "Вакансия")
-        if is_tm_vacant:
-            mgr_id, mgr_name = vacant_tm_id or None, _resolve(vacant_tm_id, lookup).get("full_name")
-        else:
-            mgr_id, mgr_name = (rm_id or None), rm_row.get("full_name")
+        mgr_id, mgr_name, tm_id, tm_name = _tm_assignment_for_sv(sv, lookup)
 
         rows.append({
             "manager_id":    mgr_id,
             "manager_name":  mgr_name,
-            "tm_id":         tm_id if tm_id in lookup else None,
-            "tm_name":       "Вакансия" if is_tm_vacant else tm_row.get("full_name"),
+            "tm_id":         tm_id,
+            "tm_name":       tm_name,
             "sv_id":         sv["employee_id"],
             "sv_name":       sv["full_name"],
             "sv_city":       sv["city"],
+            "sv_route":      sv.get("attribute"),
             "employee_id":   None,
             "employee_name": None,
             "position":      None,
@@ -165,6 +134,7 @@ def build_teams(dim: pd.DataFrame = None) -> pd.DataFrame:
         "sv_id":        "ID супервайзера",
         "sv_name":      "Супервайзер",
         "sv_city":      "Город супервайзера",
+        "sv_route":     "Код маршрута СВ",
         "employee_id":  "ID мерчендайзера",
         "employee_name":"Мерчендайзер",
         "position":     "Должность",
@@ -183,6 +153,7 @@ def build_teams(dim: pd.DataFrame = None) -> pd.DataFrame:
         "ID супервайзера",
         "Супервайзер",
         "Город супервайзера",
+        "Код маршрута СВ",
         "ID мерчендайзера",
         "Мерчендайзер",
         "Должность",
@@ -203,5 +174,3 @@ def build_teams(dim: pd.DataFrame = None) -> pd.DataFrame:
 
     save_parquet(teams_out, output)
     return teams
-
-

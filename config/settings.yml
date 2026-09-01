@@ -1,8 +1,28 @@
 project: "H&N"
 
+corporate_university:
+  dsn: HN_Corporate_University
+  user: dashboard_ro
+  credential_service: HN_Corporate_University
+  password_env: HN_CU_PASSWORD
+  connect_timeout_seconds: 15
+  query_timeout_seconds: 180
+
+vpn:
+  host: vpn.open-com.ru
+  credential_service: HN_Cisco_VPN
+  cli_path: C:/Program Files (x86)/Cisco/Cisco AnyConnect Secure Mobility Client/vpncli.exe
+  ui_path: C:/Program Files (x86)/Cisco/Cisco AnyConnect Secure Mobility Client/vpnui.exe
+  database_host: prod-cu03.open-com.ru
+  database_port: 3306
+  endpoint_timeout_seconds: 3
+  connection_timeout_seconds: 90
+  disconnect_timeout_seconds: 20
+
 paths:
   raw: data/raw
   out: data/out
+  cache: data/cache
 
 sources:
   oed:
@@ -12,14 +32,27 @@ sources:
     folder: data/raw/okk
     output: data/out/okk_fact.parquet
   learning:
-    folder: data/raw/learning
+    source: corporate_university
     output: data/out/learning_fact.parquet
   kpi:
     folder: data/raw/kpi
+    # Месячные проверенные архивы HN_KPI_YYYYMM.zip из клиентской SQL-базы.
+    # Если пакет месяца присутствует, он является единственным источником визитов
+    # этого месяца; Excel RTM и файлы логинов используются только для остальных
+    # исторических месяцев.
+    sql_export_folder: data/raw/kpi/sql_exports
     output: data/out/kpi_fact.parquet
   users:
-    folder: data/raw/users
+    source: corporate_university
     output: data/out/dim_employees.parquet
+  tm_assignments:
+    folder: data/raw/users/Привязки ТМ
+  open_vacancies:
+    file: data/raw/users/open_vacation/ВАКАНСИИ И ЭТАПЫ ПОДБОРА.xlsx
+  closed_vacancies:
+    folder: data/raw/users/closed_vacation
+  hr_registry:
+    folder: data/raw/users/kardovyi_db
   enps:
     folder: data/raw/enps
     output: data/out/enps_fact.parquet
@@ -40,6 +73,49 @@ sources:
 # нового периода теперь достаточно поправить значения здесь.
 reporting:
   start_yearmonth: 202601
+  expected_latest_yearmonth: 202608
+  freshness_tables:
+    - page1_region_monthly_snapshot.parquet
+    - page2_sv_monthly_snapshot.parquet
+    - page3_merch_monthly_snapshot.parquet
+    - page4_tt_monthly_snapshot.parquet
+    - page5_sv_monthly_snapshot.parquet
+    - page6_okk_region_monthly.parquet
+    - page7_tm_monthly_snapshot.parquet
+    - page8_learning_course_summary.parquet
+  # Только эти parquet публикуются в data/out и доступны Power BI.
+  # Остальные файлы создаются временно внутри staging для расчётов и QA.
+  powerbi_column_contract: reports/powerbi_cleanup_plan.json
+  publish_tables:
+    - dim_employees.parquet
+    - dim_teams.parquet
+    - dMonth.parquet
+    - dRegion.parquet
+    - dSupervisor.parquet
+    - dTM.parquet
+    - learning_monthly.parquet
+    - okk_fact.parquet
+    - org_staffing_report_snapshot.parquet
+    - page1_region_monthly_snapshot.parquet
+    - page2_actions_monthly.parquet
+    - page2_sv_monthly_snapshot.parquet
+    - page3_merch_monthly_snapshot.parquet
+    - page4_tt_formula.parquet
+    - page4_tt_monthly_snapshot.parquet
+    - page4_tt_status_legend.parquet
+    - page5_sv_monthly_snapshot.parquet
+    - page6_okk_insights_monthly.parquet
+    - page6_okk_region_monthly.parquet
+    - page7_tm_monthly_snapshot.parquet
+    - page8_learning_course_summary.parquet
+    - page8_learning_employee_matrix.parquet
+    - page9_climate_blocks_region.parquet
+    - page9_climate_quarterly_region.parquet
   client_attestation_quarters:
     20254: "Аттестация клиента Q4 2025 %"
     20261: "Аттестация клиента Q1 2026 %"
+
+business_rules:
+  page2:
+    kpi_red_min: 0.95
+    learning_red_min: 0.90

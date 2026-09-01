@@ -13,13 +13,18 @@ from scripts.utils import (
     normalize_pct as _normalize_pct,
     normalize_valid_pct as _normalize_valid_pct,
     normalize_person_name as _normalize_name,
+    mean_numeric as _mean_numeric,
     last_notna as _first_notna,
     extract_sv_code as _extract_sv_code,
 )
 from scripts.staffing_utils import (
+    is_tm_role,
+    missing_supervisor_key,
+    normalize_confirmed_tm,
     score_higher_is_better as _score_higher_is_better,
     score_lower_is_better as _score_lower_is_better,
 )
+from scripts.kpi_metric_utils import aggregate_employee_kpi_to_org
 
 
 CLIENT_ATTESTATION_QUARTERS = load_settings()["reporting"]["client_attestation_quarters"]
@@ -27,8 +32,13 @@ CLIENT_ATTESTATION_QUARTERS = load_settings()["reporting"]["client_attestation_q
 SV_MIN_AVAILABLE_WEIGHT = 0.60
 SV_STATUS_STABLE_MIN_SCORE = 0.90
 
-SV_KPI_GREEN_MIN = 0.95
-SV_KPI_RED_MIN = 0.90
+SV_KPI_GREEN_MIN = 0.99
+SV_KPI_RED_MIN = 0.95
+SV_KPI_COMPONENT_GREEN_MINS = {
+    "PICOS": 0.98,
+    "OSA": 0.95,
+    "TOP16": 0.95,
+}
 SV_OKK_GREEN_MIN = 0.60
 SV_OKK_RED_MIN = 0.40
 SV_LEARNING_SOFT_MIN = 0.95
@@ -49,14 +59,18 @@ SV_EFFECTIVENESS_WEIGHTS = {
     "Текучесть команды %": 0.05,
 }
 SV_SIGNAL_WEIGHTS = {
-    "KPI проекта": SV_EFFECTIVENESS_WEIGHTS["KPI месяца %"],
     "ОКК команды": SV_EFFECTIVENESS_WEIGHTS["ОКК команды %"],
     "Обучение команды": SV_EFFECTIVENESS_WEIGHTS["Обучение команды %"],
     "Фрод": SV_EFFECTIVENESS_WEIGHTS["Фрод %"],
     "Стабильность команды": SV_EFFECTIVENESS_WEIGHTS["Стабильность команды %"],
     "Текучесть": SV_EFFECTIVENESS_WEIGHTS["Текучесть команды %"],
 }
-SV_EFFECTIVENESS_CRITICAL_COLUMNS = ["KPI месяца %", "ОКК команды %"]
+SV_KPI_SIGNAL_COLUMNS = {
+    "PICOS": "PICOS выполнение %",
+    "OSA": "OSA выполнение %",
+    "TOP16": "TOP16 выполнение %",
+}
+SV_EFFECTIVENESS_CRITICAL_COLUMNS = ["KPI месяца %"]
 
 SV_PERSONAL_MIN_AVAILABLE_WEIGHT = 0.60
 SV_PERSONAL_HIGH_MIN_SCORE = 0.95
@@ -78,27 +92,44 @@ OED_WEIGHT_FLOOR = 0.10
 RESERVE_CANDIDATE_MIN_SCORE = 0.90
 RESERVE_CANDIDATE_MIN_STAFFING = 0.80
 
-SV_OVERALL_REASONS = {
-    "показатели команды в целом ниже минимального уровня",
-    "показатели команды в целом снижены",
-    "показатели команды в целом ниже стабильного уровня",
-}
+NO_TM_ID = "NO_TM"
+NO_TM_NAME = "Вакансия / нет ТМ"
+NO_SV_ID = "NO_SV"
+NO_SV_NAME = "Вакансия / нет СВ"
 
-SV_REASON_SHORT_LABELS = {
-    "показатели команды в целом ниже минимального уровня": "низкая эффективность команды",
-    "показатели команды в целом снижены": "снижена эффективность команды",
-    "показатели команды в целом ниже стабильного уровня": "эффективность ниже стабильной",
-    "KPI месяца ниже целевого уровня": "KPI ниже цели",
-    "KPI месяца требует контроля": "KPI требует внимания",
-    "низкое качество визитов команды": "низкое качество",
-    "качество визитов команды требует контроля": "качество требует внимания",
-    "низкое прохождение обязательного обучения": "обучение ниже цели",
-    "обязательное обучение требует контроля": "обучение требует внимания",
-    "высокий фрод в команде": "высокий фрод",
-    "фрод выше нормы": "фрод выше нормы",
-    "низкая кадровая устойчивость команды": "нестабильная команда",
-    "кадровая устойчивость требует контроля": "стабильность команды требует внимания",
-}
+
+def _build_no_sv_supervisor_rows(teams: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    if teams is None or teams.empty or "ID супервайзера" not in teams.columns:
+        return pd.DataFrame(columns=columns)
+
+    work = teams.replace("", pd.NA).copy()
+    missing_sv = work["ID супервайзера"].isna() | work["ID супервайзера"].astype("string").str.strip().eq(NO_SV_ID).fillna(False)
+    work = work[missing_sv].copy()
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+
+    work["Регион BI"] = work.get("Регион BI", pd.Series(index=work.index, dtype="object")).replace("", pd.NA).fillna("Без региона")
+    work["Группа региона"] = work.get("Группа региона", pd.Series(index=work.index, dtype="object")).replace("", pd.NA).fillna("core")
+    work["ID территориального менеджера"] = (
+        work.get("ID территориального менеджера", pd.Series(index=work.index, dtype="object"))
+        .replace("", pd.NA)
+    )
+    work = normalize_confirmed_tm(work)
+    work["ID супервайзера"] = work.apply(
+        lambda row: missing_supervisor_key(row.get("Регион BI"), row.get("ID территориального менеджера")),
+        axis=1,
+    )
+    work["Супервайзер"] = NO_SV_NAME
+    work["Дата приема СВ"] = pd.NaT
+    work["Стаж СВ (дней)"] = pd.NA
+    work["Стаж СВ (месяцев)"] = pd.NA
+    work["Код СВ"] = NO_SV_ID
+    work["СВ / Объект"] = NO_SV_NAME
+    if "Показывать в срезе" in columns:
+        work["Показывать в срезе"] = True
+
+    return work[columns].drop_duplicates("ID супервайзера")
+
 
 def _effective_oed_month(series: pd.Series) -> pd.Series:
     quarter_start = pd.to_datetime(series, errors="coerce")
@@ -222,18 +253,6 @@ def _personal_weak_metric_records(row: pd.Series) -> list[dict]:
     return sorted(records, key=lambda record: (-record["priority"], -record["weight"], record["order"]))
 
 
-def _personal_weak_metrics_from_row(row: pd.Series) -> list[str]:
-    return list(dict.fromkeys(record["metric"] for record in _personal_weak_metric_records(row)))
-
-
-def _personal_weak_summary_from_row(row: pd.Series) -> tuple[int, float, float]:
-    records = _personal_weak_metric_records(row)
-    weak_count = len(records)
-    weak_weight = sum(record["weight"] for record in records)
-    red_weight = sum(record["weight"] for record in records if record["level"] == "hard")
-    return weak_count, weak_weight, red_weight
-
-
 def _personal_status_from_row(row: pd.Series) -> str:
     score = row.get("Личная эффективность СВ %")
     available_weight = row.get("Доступность личных метрик %")
@@ -266,12 +285,6 @@ def _personal_status_from_row(row: pd.Series) -> str:
 
 
 def _personal_reason_from_row(row: pd.Series):
-    status = row.get("Статус личной эффективности")
-    if status == "Новичок":
-        return "Новичок"
-    if status == "Недостаточно данных":
-        return "Недостаточно данных"
-
     hard_parts = list(
         dict.fromkeys(
             record["metric"]
@@ -281,27 +294,17 @@ def _personal_reason_from_row(row: pd.Series):
     )
     if hard_parts:
         return ", ".join(hard_parts)
-    if _all_personal_effectiveness_metrics_green(row):
-        return "Все личные метрики выше целевого уровня"
     return pd.NA
-
-
-def _all_personal_effectiveness_metrics_green(row: pd.Series) -> bool:
-    for column in SV_PERSONAL_EFFECTIVENESS_WEIGHTS:
-        value = row.get(column)
-        if pd.isna(value) or float(value) < SV_PERSONAL_GREEN_MIN:
-            return False
-    return True
 
 
 def _score_zone(score) -> str:
     if pd.isna(score):
         return "Недостаточно данных"
     if score >= SV_STATUS_STABLE_MIN_SCORE:
-        return "Стабильно"
+        return "Высокая готовность"
     if score >= 0.80:
-        return "Контроль"
-    return "Зона риска"
+        return "Соответствует роли"
+    return "Зона развития"
 
 
 def _staffing_signal_level(row: pd.Series) -> str | None:
@@ -316,7 +319,6 @@ def _staffing_signal_level(row: pd.Series) -> str | None:
 
 
 def _sv_signal_records(row: pd.Series) -> list[dict]:
-    kpi = row.get("KPI месяца %")
     okk = row.get("ОКК команды %")
     learning = row.get("Обучение команды %")
     fraud_pct = row.get("Фрод %")
@@ -324,8 +326,8 @@ def _sv_signal_records(row: pd.Series) -> list[dict]:
 
     records: list[dict] = []
 
-    def add_signal(metric: str, level: str, order: int):
-        weight = SV_SIGNAL_WEIGHTS[metric]
+    def add_signal(metric: str, level: str, order: int, weight: float | None = None):
+        weight = SV_SIGNAL_WEIGHTS[metric] if weight is None else weight
         severity = 1.0 if level == "hard" else 0.5
         records.append(
             {
@@ -337,41 +339,51 @@ def _sv_signal_records(row: pd.Series) -> list[dict]:
             }
         )
 
-    if pd.notna(kpi):
-        if kpi < SV_KPI_RED_MIN:
-            add_signal("KPI проекта", "hard", 1)
-        elif kpi < SV_KPI_GREEN_MIN:
-            add_signal("KPI проекта", "soft", 1)
+    active_kpi_components = [
+        (label, pd.to_numeric(row.get(column), errors="coerce"))
+        for label, column in SV_KPI_SIGNAL_COLUMNS.items()
+        if pd.notna(pd.to_numeric(row.get(column), errors="coerce"))
+    ]
+    kpi_signal_weight = (
+        SV_EFFECTIVENESS_WEIGHTS["KPI месяца %"] / len(active_kpi_components)
+        if active_kpi_components
+        else 0.0
+    )
+    for order, (label, value) in enumerate(active_kpi_components, start=1):
+        if value < SV_KPI_RED_MIN:
+            add_signal(label, "hard", order, kpi_signal_weight)
+        elif value < SV_KPI_COMPONENT_GREEN_MINS[label]:
+            add_signal(label, "soft", order, kpi_signal_weight)
 
     if pd.notna(okk):
         if okk < SV_OKK_RED_MIN:
-            add_signal("ОКК команды", "hard", 2)
+            add_signal("ОКК команды", "hard", 4)
         elif okk < SV_OKK_GREEN_MIN:
-            add_signal("ОКК команды", "soft", 2)
+            add_signal("ОКК команды", "soft", 4)
 
     if pd.notna(learning):
         if learning < SV_LEARNING_HARD_MIN:
-            add_signal("Обучение команды", "hard", 3)
+            add_signal("Обучение команды", "hard", 5)
         elif learning < SV_LEARNING_SOFT_MIN:
-            add_signal("Обучение команды", "soft", 3)
+            add_signal("Обучение команды", "soft", 5)
 
     if pd.notna(fraud_pct):
         if fraud_pct > SV_FRAUD_RED_MAX:
-            add_signal("Фрод", "hard", 4)
+            add_signal("Фрод", "hard", 6)
         elif fraud_pct > SV_FRAUD_GREEN_MAX:
-            add_signal("Фрод", "soft", 4)
+            add_signal("Фрод", "soft", 6)
 
     staffing_level = _staffing_signal_level(row)
     if staffing_level == "hard":
-        add_signal("Стабильность команды", "hard", 5)
+        add_signal("Стабильность команды", "hard", 7)
     elif staffing_level == "soft":
-        add_signal("Стабильность команды", "soft", 5)
+        add_signal("Стабильность команды", "soft", 7)
 
     if pd.notna(turnover):
         if turnover > SV_TURNOVER_RED_MAX:
-            add_signal("Текучесть", "hard", 6)
+            add_signal("Текучесть", "hard", 8)
         elif turnover > SV_TURNOVER_GREEN_MAX:
-            add_signal("Текучесть", "soft", 6)
+            add_signal("Текучесть", "soft", 8)
 
     return records
 
@@ -409,19 +421,6 @@ def _sv_signal_weight_summary(row: pd.Series) -> pd.Series:
     )
 
 
-def _sv_weak_metrics_by_priority(row: pd.Series) -> list[str]:
-    records = sorted(
-        _sv_signal_records(row),
-        key=lambda record: (-record["priority"], -record["weight"], record["order"]),
-    )
-    return [record["metric"] for record in records]
-
-
-def _sv_score_driver_metrics_by_priority(row: pd.Series) -> list[str]:
-    hard, _ = _sv_signal_lists(row)
-    return hard
-
-
 def _status_from_row(row: pd.Series) -> str:
     available_weight = row.get("Доступность метрик СВ %")
     score = row.get("Индекс эффективности СВ %")
@@ -434,27 +433,11 @@ def _status_from_row(row: pd.Series) -> str:
         return "Недостаточно данных"
 
     hard, soft = _sv_signal_lists(row)
+    if hard or score < 0.80:
+        return "Зона развития"
     if score >= SV_STATUS_STABLE_MIN_SCORE and not soft:
-        return "Стабильно"
-    if score < 0.80:
-        return "Зона риска"
-    return "Контроль"
-
-
-def _all_sv_effectiveness_metrics_green(row: pd.Series) -> bool:
-    checks = [
-        ("KPI месяца %", lambda value: value >= SV_KPI_GREEN_MIN),
-        ("ОКК команды %", lambda value: value >= SV_OKK_GREEN_MIN),
-        ("Обучение команды %", lambda value: value >= SV_LEARNING_SOFT_MIN),
-        ("Фрод %", lambda value: value <= SV_FRAUD_GREEN_MAX),
-        ("Стабильность команды %", lambda value: value >= SV_STAFFING_SOFT_MIN),
-        ("Текучесть команды %", lambda value: value <= SV_TURNOVER_GREEN_MAX),
-    ]
-    for column, is_green in checks:
-        value = row.get(column)
-        if pd.isna(value) or not is_green(float(value)):
-            return False
-    return True
+        return "Высокая готовность"
+    return "Соответствует роли"
 
 
 def _signal_text(row: pd.Series, level: str) -> str:
@@ -468,29 +451,11 @@ def _signal_count(row: pd.Series, level: str) -> int:
     return len(hard if level == "hard" else soft)
 
 
-def _compact_reason_from_signals(hard: list[str], soft: list[str]):
-    reasons = hard if hard else soft
-    if not reasons:
-        return "метрики в целевой зоне"
-
-    concrete = [reason for reason in reasons if reason not in SV_OVERALL_REASONS]
-    selected = concrete if concrete else reasons
-    short_labels = [SV_REASON_SHORT_LABELS.get(reason, reason) for reason in selected]
-
-    if len(short_labels) == 1:
-        return short_labels[0]
-    return ", ".join(dict.fromkeys(short_labels))
-
-
 def _status_reason_from_row(row: pd.Series):
     hard, _ = _sv_signal_lists(row)
-    if hard:
-        return ", ".join(dict.fromkeys(hard))
-    if row.get("Статус эффективности СВ") == "Недостаточно данных":
-        return "Недостаточно данных"
-    if _all_sv_effectiveness_metrics_green(row):
-        return "Все метрики выше целевого уровня"
-
+    reasons = list(dict.fromkeys(hard))
+    if reasons:
+        return ", ".join(dict.fromkeys(reasons))
     return pd.NA
 
 
@@ -508,7 +473,7 @@ def _reserve_from_row(row: pd.Series) -> str:
         pd.notna(score)
         and score >= RESERVE_CANDIDATE_MIN_SCORE
         and (pd.isna(staffing) or staffing >= RESERVE_CANDIDATE_MIN_STAFFING)
-        and status == "Стабильно"
+        and status == "Высокая готовность"
     ):
         return "кандидат"
     return "развитие на текущей роли"
@@ -604,8 +569,14 @@ def _build_supervisor_directory(
         ].copy()
     elif "Должность" in dim.columns:
         dim = dim[dim["Должность"].astype(str).str.lower().str.contains("супервайзер", na=False)].copy()
+    tm_dim = dim_employees.copy()
+    if {"Активен", "Должность"}.issubset(tm_dim.columns):
+        tm_dim = tm_dim[tm_dim["Активен"].fillna(False).eq(True) & tm_dim["Должность"].map(is_tm_role)].copy()
+    else:
+        tm_dim = tm_dim[tm_dim["Должность"].map(is_tm_role)].copy()
+    valid_tm_ids = set(tm_dim["ID сотрудника"].dropna().astype(str).str.strip()) if "ID сотрудника" in tm_dim.columns else set()
     tm_lookup = (
-        dim_employees[["ID сотрудника", "ФИО"]]
+        tm_dim[["ID сотрудника", "ФИО"]]
         .dropna(subset=["ID сотрудника"])
         .drop_duplicates("ID сотрудника")
         .rename(
@@ -651,8 +622,13 @@ def _build_supervisor_directory(
             dim.get("Территориальный менеджер dim raw")
         )
 
+    teams_work = teams.replace("", pd.NA).copy()
+    tm_ids = teams_work["ID территориального менеджера"].astype("string").str.strip()
+    invalid_tm = tm_ids.notna() & ~tm_ids.isin(valid_tm_ids) & tm_ids.ne(NO_TM_ID)
+    teams_work.loc[invalid_tm, "ID территориального менеджера"] = pd.NA
+    teams_work.loc[invalid_tm, "Территориальный менеджер"] = pd.NA
     teams_dir = (
-        teams.replace("", pd.NA)
+        teams_work
         .dropna(subset=["ID супервайзера"])
         .groupby("ID супервайзера", dropna=False)
         .agg(
@@ -685,8 +661,11 @@ def _build_supervisor_directory(
     )
     directory["ID территориального менеджера"] = directory["ID территориального менеджера"].replace("", pd.NA)
     directory["Территориальный менеджер"] = directory["Территориальный менеджер"].replace("", pd.NA)
-    directory["ID территориального менеджера"] = directory["ID территориального менеджера"].fillna("NO_TM")
-    directory["Территориальный менеджер"] = directory["Территориальный менеджер"].fillna("Вакансия / нет ТМ")
+    tm_ids = directory["ID территориального менеджера"].astype("string").str.strip()
+    invalid_tm = tm_ids.notna() & ~tm_ids.isin(valid_tm_ids)
+    directory.loc[invalid_tm, "ID территориального менеджера"] = pd.NA
+    directory.loc[invalid_tm, "Территориальный менеджер"] = pd.NA
+    directory = normalize_confirmed_tm(directory)
     directory["Код СВ"] = directory["Код СВ"].combine_first(_extract_sv_code(directory["ID супервайзера"]))
     directory["СВ / Объект"] = directory["Код СВ"].combine_first(directory["Супервайзер"]).fillna("СВ")
     directory["Имя норм"] = directory["Супервайзер"].map(_normalize_name)
@@ -717,14 +696,70 @@ def _build_team_size_monthly(teams: pd.DataFrame, month_source: pd.DataFrame) ->
     return months.merge(current_team, how="cross")
 
 
-def _mean_numeric(series: pd.Series):
-    numeric = pd.to_numeric(series, errors="coerce")
-    return numeric.mean() if numeric.notna().any() else pd.NA
-
-
 def _max_numeric(series: pd.Series):
     numeric = pd.to_numeric(series, errors="coerce")
     return numeric.max() if numeric.notna().any() else pd.NA
+
+
+def _add_supervisor_monthly_rank(monthly: pd.DataFrame) -> pd.DataFrame:
+    if monthly.empty:
+        result = monthly.copy()
+        result["Ранг СВ"] = pd.Series(dtype="Int64")
+        return result
+
+    pieces = []
+    for _, month_df in monthly.groupby("MonthStart", sort=True, dropna=False):
+        ranked = month_df.sort_values(
+            [
+                "Индекс эффективности СВ %",
+                "KPI месяца %",
+                "ОКК команды %",
+                "Обучение команды %",
+                "Стабильность команды %",
+                "ID супервайзера",
+            ],
+            ascending=[False, False, False, False, False, True],
+            na_position="last",
+            kind="mergesort",
+        ).copy()
+        ranked["Ранг СВ"] = pd.array(range(1, len(ranked) + 1), dtype="Int64")
+        pieces.append(ranked)
+
+    return pd.concat(pieces, ignore_index=True)
+
+
+def _refresh_sv_effectiveness(monthly: pd.DataFrame) -> pd.DataFrame:
+    result = monthly.copy()
+    result["KPI месяца %"] = _normalize_pct(result["KPI месяца %"])
+    result["Доступность метрик СВ %"] = result.apply(_available_weight_from_row, axis=1)
+    result["Индекс эффективности СВ %"] = pd.to_numeric(
+        result.apply(_weighted_score_from_row, axis=1),
+        errors="coerce",
+    ).round(4)
+    result["Зона эффективности СВ"] = result["Индекс эффективности СВ %"].map(_score_zone)
+    result["Красных сигналов СВ"] = result.apply(lambda row: _signal_count(row, "hard"), axis=1)
+    result["Мягких сигналов СВ"] = result.apply(lambda row: _signal_count(row, "soft"), axis=1)
+    result["Красные сигналы СВ"] = result.apply(lambda row: _signal_text(row, "hard"), axis=1)
+    result["Мягкие сигналы СВ"] = result.apply(lambda row: _signal_text(row, "soft"), axis=1)
+    result[
+        [
+            "Вес красных флагов СВ %",
+            "Вес желтых флагов СВ %",
+            "Приоритетный вес проблем СВ %",
+        ]
+    ] = result.apply(_sv_signal_weight_summary, axis=1)
+    result["Статус эффективности СВ"] = result.apply(_status_from_row, axis=1)
+    result["Зона эффективности СВ"] = result["Статус эффективности СВ"]
+    result["Причина статуса СВ"] = result.apply(_status_reason_from_row, axis=1)
+    result["Операционная эффективность %"] = result["Индекс эффективности СВ %"]
+    result["Score месяца"] = result["Индекс эффективности СВ %"]
+    result["Балл эффективности %"] = result["Индекс эффективности СВ %"]
+    result["Балл эффективности"] = np.floor(result["Балл эффективности %"] * 100 + 1e-9)
+    result["Score резерва"] = result["Балл эффективности %"]
+    result["Статус резерва СВ"] = result.apply(_reserve_from_row, axis=1)
+    result["Резерв"] = result["Статус резерва СВ"]
+    result["Статус"] = result["Статус эффективности СВ"]
+    return _add_supervisor_monthly_rank(result)
 
 
 def _sum_numeric(series: pd.Series):
@@ -1132,16 +1167,19 @@ def _build_monthly_snapshot(
     if "СВ / Объект_dir" in monthly.columns:
         monthly["СВ / Объект"] = monthly["СВ / Объект_dir"].combine_first(monthly["СВ / Объект"])
     if "Регион BI_dir" in monthly.columns:
-        monthly["Регион BI"] = monthly.get("Регион BI_dir")
+        monthly["Регион BI"] = monthly["Регион BI_dir"].combine_first(monthly["Регион BI"])
     if "Группа региона_dir" in monthly.columns:
         monthly["Группа региона"] = monthly.get("Группа региона_dir")
     if "ID территориального менеджера_dir" in monthly.columns:
-        monthly["ID территориального менеджера"] = monthly.get("ID территориального менеджера_dir")
+        monthly["ID территориального менеджера"] = monthly["ID территориального менеджера_dir"].combine_first(
+            monthly.get("ID территориального менеджера")
+        )
     if "Территориальный менеджер_dir" in monthly.columns:
-        monthly["Территориальный менеджер"] = monthly.get("Территориальный менеджер_dir")
+        monthly["Территориальный менеджер"] = monthly["Территориальный менеджер_dir"].combine_first(
+            monthly.get("Территориальный менеджер")
+        )
     monthly = monthly.drop(columns=[c for c in monthly.columns if c.endswith("_dir")], errors="ignore")
-    monthly["ID территориального менеджера"] = monthly["ID территориального менеджера"].replace("", pd.NA).fillna("NO_TM")
-    monthly["Территориальный менеджер"] = monthly["Территориальный менеджер"].replace("", pd.NA).fillna("Вакансия / нет ТМ")
+    monthly = normalize_confirmed_tm(monthly)
     monthly["KPI месяца %"] = _normalize_pct(monthly["KPI месяца %"])
     monthly["ОКК команды %"] = _normalize_pct(monthly["ОКК команды %"])
     monthly["Обучение команды %"] = _normalize_pct(monthly["Обучение команды %"])
@@ -1184,22 +1222,26 @@ def _build_monthly_snapshot(
         monthly["Личная эффективность СВ %"],
         errors="coerce",
     ).round(4)
-    monthly["Балл личной эффективности"] = np.floor(monthly["Личная эффективность СВ %"] * 100)
+    monthly["Балл личной эффективности"] = np.floor(
+        monthly["Личная эффективность СВ %"] * 100 + 1e-9
+    )
     monthly["Статус личной эффективности"] = monthly.apply(_personal_status_from_row, axis=1)
     monthly["Причина личной эффективности"] = monthly.apply(_personal_reason_from_row, axis=1)
     monthly["Операционная эффективность %"] = monthly["Индекс эффективности СВ %"]
     monthly["Score месяца"] = monthly["Индекс эффективности СВ %"]
     monthly["Личная оценка %"] = monthly["Личная эффективность СВ %"]
     monthly["Балл эффективности %"] = monthly["Индекс эффективности СВ %"]
-    monthly["Балл эффективности"] = np.floor(monthly["Балл эффективности %"] * 100)
+    monthly["Балл эффективности"] = np.floor(monthly["Балл эффективности %"] * 100 + 1e-9)
     monthly["Score резерва"] = monthly["Балл эффективности %"]
     monthly["Статус резерва СВ"] = monthly.apply(_reserve_from_row, axis=1)
     monthly["Резерв"] = monthly["Статус резерва СВ"]
     monthly["Статус"] = monthly["Статус эффективности СВ"]
+    monthly = _add_supervisor_monthly_rank(monthly)
 
     columns = [
         "MonthStart",
         "YearMonth",
+        "Ранг СВ",
         "QuarterStart",
         "YearQuarter",
         "QuarterLabel",
@@ -1270,6 +1312,7 @@ def _build_monthly_snapshot(
 
     numeric_columns = [
         "YearMonth",
+        "Ранг СВ",
         "YearQuarter",
         "KPI ОЭД %",
         "Стаж СВ (дней)",
@@ -1337,7 +1380,7 @@ def _build_monthly_snapshot(
     quarterly_out = oed_quarterly.merge(
         d_supervisor[["ID супервайзера", "СВ / Объект"]],
         on="ID супервайзера",
-        how="left",
+        how="inner",
     )
     quarterly_numeric = [
         "YearQuarter",
@@ -1362,7 +1405,7 @@ def _build_legend() -> pd.DataFrame:
             {
                 "Порядок": 1,
                 "Категория": "Формула",
-                "Описание": "Балл эффективности СВ: KPI 35%, ОКК команды 15%, обучение команды 15%, фрод 15%, стабильность команды 15%, текучесть 5%; клиентская аттестация и личная эффективность в этом балле не участвуют",
+                "Описание": "Балл эффективности СВ: клиентский KPI 35% (PICOS либо OSA + TOP16 по правилам ТТ), ОКК команды 15%, обучение команды 15%, фрод 15%, стабильность команды 15%, текучесть 5%; клиентская аттестация и личная эффективность в этом балле не участвуют",
             },
             {
                 "Порядок": 2,
@@ -1371,28 +1414,28 @@ def _build_legend() -> pd.DataFrame:
             },
             {
                 "Порядок": 3,
-                "Категория": "Стабильно",
+                "Категория": "Высокая готовность",
                 "Описание": "балл от 90%, нет желтых и красных управленческих флагов",
             },
             {
                 "Порядок": 4,
-                "Категория": "Контроль",
-                "Описание": "данных достаточно, но есть желтая зона, красный флаг с небольшим весом или балл ниже 90%",
+                "Категория": "Соответствует роли",
+                "Описание": "данных достаточно, красных флагов нет, но есть желтая зона или балл ниже 90%",
             },
             {
                 "Порядок": 5,
-                "Категория": "Зона риска",
-                "Описание": "итоговый балл ниже 80%; красные флаги показываются в причине статуса, но маловесный красный флаг сам по себе не переводит СВ в риск",
+                "Категория": "Зона развития",
+                "Описание": "итоговый балл ниже 80% или есть хотя бы один красный управленческий флаг",
             },
             {
                 "Порядок": 6,
                 "Категория": "Причины статуса",
-                "Описание": "в причину статуса выводятся только красные флаги; если красных флагов нет, поле пустое; если все метрики зеленые, пишется Все метрики выше целевого уровня",
+                "Описание": "выводятся только красные управленческие метрики; если красных флагов нет, поле пустое",
             },
             {
                 "Порядок": 7,
                 "Категория": "Резерв СВ",
-                "Описание": "кандидатом становится только класс ОЭД ТОП при статусе Стабильно и стабильности команды от 80%",
+                "Описание": "кандидатом становится только класс ОЭД ТОП при статусе Высокая готовность и стабильности команды от 80%",
             },
             {
                 "Порядок": 8,
@@ -1400,31 +1443,6 @@ def _build_legend() -> pd.DataFrame:
                 "Описание": "высокая личная готовность: балл от 95%, все личные метрики зеленые и класс ОЭД ТОП; соответствует роли: балл от 90% без красных флагов; зона развития: балл ниже 90% или красный флаг; новичок: ОЭД еще не проходил",
             },
         ]
-    )
-
-
-def _build_current_open_vacancies_by_sv(out_dir: Path) -> pd.DataFrame:
-    path = out_dir / "fact_open_vacancies.parquet"
-    if not path.exists():
-        return pd.DataFrame(columns=["ID супервайзера"])
-
-    vacancies = pd.read_parquet(path)
-    vacancies = vacancies[vacancies["ID супервайзера"].notna()].copy()
-    if vacancies.empty:
-        return pd.DataFrame(columns=["ID супервайзера"])
-
-    return (
-        vacancies.groupby("ID супервайзера", dropna=False)
-        .agg(
-            **{
-                "Открытых вакансий": ("ID вакансии", "nunique"),
-                "Открытых вакансий МЕ": ("Роль вакансии", lambda s: s.eq("МЕ").sum()),
-                "Открытых вакансий СВ": ("Роль вакансии", lambda s: s.eq("СВ").sum()),
-                "Приостановленных вакансий": ("Приостановлена", lambda s: s.fillna(False).eq(True).sum()),
-                "Дата среза вакансий": ("SnapshotDate", "max"),
-            }
-        )
-        .reset_index()
     )
 
 
@@ -1490,9 +1508,7 @@ def _build_me_flow_by_sv(out_dir: Path) -> pd.DataFrame:
 
 def _attach_staffing_metrics(monthly: pd.DataFrame, out_dir: Path) -> pd.DataFrame:
     result = monthly.copy()
-    staffing_path = out_dir / "org_staffing_sv_monthly_snapshot.parquet"
-    if not staffing_path.exists():
-        staffing_path = out_dir / "org_staffing_report_snapshot.parquet"
+    staffing_path = out_dir / "org_staffing_monthly_snapshot.parquet"
     if staffing_path.exists():
         staffing = pd.read_parquet(staffing_path)
         sv_staffing = staffing[
@@ -1503,8 +1519,8 @@ def _attach_staffing_metrics(monthly: pd.DataFrame, out_dir: Path) -> pd.DataFra
             sv_staffing.groupby(["MonthStart", "YearMonth", "ID супервайзера"], dropna=False)
             .agg(
                 **{
-                    "Активных МЕ": ("Активных МЕ", _max_numeric),
-                    "Активных СВ": ("Активных СВ", _max_numeric),
+                    "Активных МЕ": ("Активных МЕ", _sum_numeric),
+                    "Активных СВ": ("Активных СВ", _sum_numeric),
                     "Открытых вакансий": ("Открытых вакансий", _sum_numeric),
                     "Открытых вакансий МЕ": ("Открытых вакансий МЕ", _sum_numeric),
                     "Открытых вакансий СВ": ("Открытых вакансий СВ", _sum_numeric),
@@ -1565,7 +1581,7 @@ def _attach_staffing_metrics(monthly: pd.DataFrame, out_dir: Path) -> pd.DataFra
         "Приостановленных вакансий",
     ]:
         if column in result.columns:
-            result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0)
+            result[column] = pd.to_numeric(result[column], errors="coerce")
 
     result["Нанято всего"] = result["Нанято"]
     result["Уволено всего"] = result["Уволено"]
@@ -1587,8 +1603,7 @@ def _attach_staffing_metrics(monthly: pd.DataFrame, out_dir: Path) -> pd.DataFra
     result["Уволено"] = result["Уволено МЕ"]
 
     result["Размер команды"] = pd.to_numeric(result.get("Размер команды"), errors="coerce")
-    result["Активных МЕ"] = result["Активных МЕ"].where(result["Активных МЕ"].gt(0), result["Размер команды"])
-    result["Команда"] = result["Активных МЕ"].fillna(result["Размер команды"])
+    result["Команда"] = result["Активных МЕ"]
     result["Плановая команда"] = result["Команда"].fillna(0) + result["Открытых вакансий МЕ"].fillna(0)
     result["Плановая команда"] = result["Плановая команда"].where(result["Плановая команда"].gt(0))
     result["Доля вакансий к активным МЕ %"] = result["Открытых вакансий МЕ"] / result["Команда"].replace(0, np.nan)
@@ -1616,6 +1631,74 @@ def build_page5_sv_oed_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame,
     attestations = pd.read_parquet(attestations_path) if attestations_path.exists() else pd.DataFrame()
 
     monthly, quarterly = _build_monthly_snapshot(page2_sv, fact_oed, dim_employees, teams, attestations, out_dir)
+    employee_kpi_path = out_dir / "kpi_employee_monthly_metrics.parquet"
+    page3_path = out_dir / "page3_merch_monthly_snapshot.parquet"
+    if employee_kpi_path.exists() and page3_path.exists():
+        sv_kpi_metrics = aggregate_employee_kpi_to_org(
+            pd.read_parquet(employee_kpi_path),
+            pd.read_parquet(page3_path),
+            "ID супервайзера",
+        )
+        monthly = monthly.merge(
+            sv_kpi_metrics,
+            on=["MonthStart", "YearMonth", "ID супервайзера"],
+            how="left",
+        )
+        monthly["KPI месяца %"] = monthly["KPI проекта %"]
+        monthly = _refresh_sv_effectiveness(monthly)
+    public_columns = [
+        "MonthStart",
+        "YearMonth",
+        "Ранг СВ",
+        "Регион BI",
+        "Группа региона",
+        "ID супервайзера",
+        "Супервайзер",
+        "Дата приема СВ",
+        "Стаж СВ (месяцев)",
+        "ID территориального менеджера",
+        "Территориальный менеджер",
+        "Код СВ",
+        "Размер команды",
+        "Плановая команда",
+        "Открытых вакансий МЕ",
+        "Нанято",
+        "Уволено",
+        "Баланс персонала",
+        "Текучесть команды %",
+        "Стабильность команды %",
+        "KPI месяца %",
+        "ОКК команды %",
+        "Обучение команды %",
+        "Фрод команды",
+        "Фрод %",
+        "Балл эффективности",
+        "Статус эффективности СВ",
+        "Причина статуса СВ",
+        "Класс ОЭД",
+        "Есть ОЭД СВ",
+        "KPI ОЭД %",
+        "Аттестация ОЭД %",
+        "Продукт ОЭД %",
+        "Управление ОЭД %",
+        "Аттестация клиента %",
+        "Аттестация клиента Q4 2025 %",
+        "Аттестация клиента Q1 2026 %",
+        "Балл личной эффективности",
+        "Статус личной эффективности",
+        "Причина личной эффективности",
+        "Резерв",
+        "PICOS план %",
+        "PICOS факт %",
+        "PICOS выполнение %",
+        "OSA план %",
+        "OSA факт %",
+        "OSA выполнение %",
+        "TOP16 план %",
+        "TOP16 факт %",
+        "TOP16 выполнение %",
+    ]
+    monthly = monthly[[column for column in public_columns if column in monthly.columns]].copy()
     d_supervisor = _build_supervisor_directory(page2_sv, dim_employees, teams)[
         [
             "ID супервайзера",
@@ -1631,6 +1714,30 @@ def build_page5_sv_oed_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame,
             "Территориальный менеджер",
         ]
     ].drop_duplicates("ID супервайзера").copy()
+    latest_source_hierarchy = (
+        monthly.sort_values(["ID супервайзера", "MonthStart"], kind="mergesort")
+        .drop_duplicates("ID супервайзера", keep="last")
+        [[
+            "ID супервайзера",
+            "Регион BI",
+            "Группа региона",
+            "ID территориального менеджера",
+            "Территориальный менеджер",
+        ]]
+    )
+    d_supervisor = d_supervisor.drop(
+        columns=["Регион BI", "Группа региона", "ID территориального менеджера", "Территориальный менеджер"],
+        errors="ignore",
+    ).merge(latest_source_hierarchy, on="ID супервайзера", how="left")
+    d_supervisor["Код СВ"] = d_supervisor["Код СВ"].replace("", pd.NA).fillna("Нет кода СВ")
+    region_present = d_supervisor["Регион BI"].astype("string").str.strip().notna() & d_supervisor["Регион BI"].astype("string").str.strip().ne("")
+    tm_present = d_supervisor["Территориальный менеджер"].astype("string").str.strip().notna() & d_supervisor["Территориальный менеджер"].astype("string").str.strip().ne("")
+    d_supervisor["Показывать в срезе"] = region_present & tm_present
+    no_sv_rows = _build_no_sv_supervisor_rows(teams, d_supervisor.columns.tolist())
+    if not no_sv_rows.empty:
+        no_sv_rows["Показывать в срезе"] = True
+        d_supervisor = pd.concat([d_supervisor, no_sv_rows], ignore_index=True)
+        d_supervisor = d_supervisor.drop_duplicates("ID супервайзера", keep="first")
     legend = _build_legend()
 
     save_parquet(monthly, str(out_dir / "page5_sv_monthly_snapshot.parquet"))

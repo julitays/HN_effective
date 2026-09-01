@@ -1,21 +1,49 @@
 import sys
-from datetime import date
 from pathlib import Path
 import pandas as pd
 
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from scripts.utils import get_active_users_scope, load_region_map, load_settings, normalize_dim, save_parquet
+from scripts.utils import get_active_users_scope, get_as_of_date, load_region_map, load_settings, normalize_dim, save_parquet
+from scripts.staffing_utils import is_tm_role, normalize_confirmed_tm
 
 
-TODAY = pd.Timestamp(date.today())
 REPORT_START_YEARMONTH = load_settings()["reporting"]["start_yearmonth"]
 REPORT_LEVEL_ORDER = {
     "Регион": 1,
     "ТМ": 2,
     "СВ": 3,
 }
+NO_TM_ID = "NO_TM"
+NO_TM_NAME = "Вакансия / нет ТМ"
+
+
+def _latest_source_month(*frames: pd.DataFrame) -> pd.Timestamp:
+    current_month = get_as_of_date().to_period("M").to_timestamp()
+    month_values: list[pd.Series] = []
+    for frame in frames:
+        if frame is None or frame.empty:
+            continue
+        for column in ["MonthStart", "MonthStart найм", "MonthStart увольнение"]:
+            if column not in frame.columns:
+                continue
+            values = pd.to_datetime(frame[column], errors="coerce").dropna()
+            if values.empty:
+                continue
+            values = values.dt.to_period("M").dt.to_timestamp()
+            month_values.append(values[values.le(current_month)])
+
+    if not month_values:
+        return current_month
+    months = pd.concat(month_values, ignore_index=True).dropna()
+    if months.empty:
+        return current_month
+    return months.max()
+
+
+def _users_snapshot_month() -> pd.Timestamp:
+    return get_as_of_date().to_period("M").to_timestamp()
 
 
 def _with_level_columns(df: pd.DataFrame, level: str) -> pd.DataFrame:
@@ -83,10 +111,10 @@ def _aggregate_levels(
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-def _build_active_headcount(dim: pd.DataFrame, teams: pd.DataFrame) -> pd.DataFrame:
+def _build_active_headcount(dim: pd.DataFrame, teams: pd.DataFrame, active_month: pd.Timestamp) -> pd.DataFrame:
     scope = get_active_users_scope(dim)
     active = scope["frame"].copy()
-    current_month = TODAY.to_period("M").to_timestamp()
+    current_month = pd.to_datetime(active_month, errors="coerce").to_period("M").to_timestamp()
 
     merch = teams.replace("", pd.NA).copy()
     merch["MonthStart"] = current_month
@@ -105,13 +133,30 @@ def _build_active_headcount(dim: pd.DataFrame, teams: pd.DataFrame) -> pd.DataFr
     merch["Открытых вакансий СВ"] = 0
     merch["Приостановленных вакансий"] = 0
 
+    teams_sv = (
+        teams.replace("", pd.NA)
+        .dropna(subset=["ID супервайзера"])
+        .groupby("ID супервайзера", dropna=False)
+        .agg(
+            **{
+                "ID территориального менеджера teams": ("ID территориального менеджера", "first"),
+                "Территориальный менеджер teams": ("Территориальный менеджер", "first"),
+                "Регион BI teams": ("Регион BI", "first"),
+            }
+        )
+        .reset_index()
+        .rename(columns={"ID супервайзера": "employee_id"})
+    )
     sv_people = active[active["position"].astype(str).str.lower().str.contains("супервайзер", na=False)].copy()
+    sv_people = sv_people.merge(teams_sv, on="employee_id", how="left")
     if "Регион BI" not in sv_people.columns:
         sv_people["Регион BI"] = pd.NA
+    sv_people["Регион BI"] = sv_people["Регион BI teams"].combine_first(sv_people["Регион BI"])
     sv_people["MonthStart"] = current_month
     sv_people["YearMonth"] = current_month.year * 100 + current_month.month
-    sv_people["ID территориального менеджера"] = sv_people["manager_id"]
-    sv_people["Территориальный менеджер"] = sv_people["manager_full_name"]
+    sv_people["ID территориального менеджера"] = sv_people["ID территориального менеджера teams"].replace("", pd.NA)
+    sv_people["Территориальный менеджер"] = sv_people["Территориальный менеджер teams"].replace("", pd.NA)
+    sv_people = normalize_confirmed_tm(sv_people)
     sv_people["ID супервайзера"] = sv_people["employee_id"]
     sv_people["Супервайзер"] = sv_people["full_name"]
     sv_people["Открытых вакансий"] = 0
@@ -128,12 +173,7 @@ def _build_active_headcount(dim: pd.DataFrame, teams: pd.DataFrame) -> pd.DataFr
     sv_people["Открытых вакансий СВ"] = 0
     sv_people["Приостановленных вакансий"] = 0
 
-    tm_people = active[
-        active["position"].astype(str).str.lower().str.contains("территориальный", na=False)
-        | active["position"].astype(str).str.lower().str.fullmatch("tm", na=False)
-        | active["position"].astype(str).str.lower().str.fullmatch("rm", na=False)
-        | active["position"].astype(str).str.lower().str.contains("менеджер", na=False)
-    ].copy()
+    tm_people = active[active["position"].map(is_tm_role)].copy()
     if "Регион BI" not in tm_people.columns:
         tm_people["Регион BI"] = pd.NA
     tm_people["MonthStart"] = current_month
@@ -181,74 +221,213 @@ def _build_active_headcount(dim: pd.DataFrame, teams: pd.DataFrame) -> pd.DataFr
     )
 
 
-def _expand_vacancy_months(
-    vacancies: pd.DataFrame,
-    *,
-    start_col: str = "Дата открытия",
-    end_col: str,
-    end_fallback_col: str | None = None,
-    include_end_month: bool = True,
+def _build_historical_headcount(hr: pd.DataFrame, active_month: pd.Timestamp) -> pd.DataFrame:
+    if hr is None or hr.empty:
+        return pd.DataFrame()
+
+    work = hr.replace("", pd.NA).copy()
+    required = {
+        "Сотрудник",
+        "Роль",
+        "Дата приема",
+        "Дата увольнения",
+        "Регион BI",
+        "ID территориального менеджера",
+        "Территориальный менеджер",
+        "ID супервайзера",
+        "Супервайзер",
+    }
+    if not required.issubset(work.columns):
+        return pd.DataFrame()
+
+    work["Дата приема"] = pd.to_datetime(work["Дата приема"], errors="coerce")
+    work["Дата увольнения"] = pd.to_datetime(work["Дата увольнения"], errors="coerce")
+    work = work[
+        work["Роль"].isin(["МЕ", "СВ"])
+        & work["Дата приема"].notna()
+        & work["Регион BI"].notna()
+    ].copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    start_year = REPORT_START_YEARMONTH // 100
+    start_month = REPORT_START_YEARMONTH % 100
+    first_month = pd.Timestamp(year=start_year, month=start_month, day=1)
+    last_month = pd.to_datetime(active_month, errors="coerce").to_period("M").to_timestamp() - pd.DateOffset(months=1)
+    if last_month < first_month:
+        return pd.DataFrame()
+
+    employee_id = work.get("ID сотрудника", pd.Series(index=work.index, dtype="object"))
+    employee_id = employee_id.astype("string").str.strip().fillna("NO_ID")
+    employee_name = work["Сотрудник"].astype("string").str.strip().fillna("NO_NAME")
+    work["Ключ кадрового эпизода"] = (
+        employee_id
+        + "|"
+        + employee_name
+        + "|"
+        + work["Дата приема"].dt.strftime("%Y-%m-%d")
+        + "|"
+        + work["Роль"].astype("string")
+    )
+    work = work.drop_duplicates("Ключ кадрового эпизода", keep="last")
+
+    frames: list[pd.DataFrame] = []
+    for month_start in pd.date_range(first_month, last_month, freq="MS"):
+        month_end = month_start + pd.offsets.MonthEnd(0)
+        active = work[
+            work["Дата приема"].le(month_end)
+            & (work["Дата увольнения"].isna() | work["Дата увольнения"].gt(month_end))
+        ].copy()
+        if active.empty:
+            continue
+
+        active["MonthStart"] = month_start
+        active["YearMonth"] = month_start.year * 100 + month_start.month
+        active["Активных МЕ"] = active["Роль"].eq("МЕ").astype(int)
+        active["Активных СВ"] = active["Роль"].eq("СВ").astype(int)
+        active["Активных ТМ"] = 0
+        for column in [
+            "Открытых вакансий",
+            "Открытых вакансий МЕ",
+            "Открытых вакансий СВ",
+            "Приостановленных вакансий",
+            "Закрытых вакансий",
+            "Успешно закрытых вакансий",
+            "Отмененных вакансий",
+            "Нанято",
+            "Уволено",
+        ]:
+            active[column] = 0
+        active["Средний срок закрытия вакансии, дни"] = pd.NA
+        frames.append(
+            _aggregate_levels(
+                active,
+                {
+                    "Активных МЕ": ("Активных МЕ", "sum"),
+                    "Активных СВ": ("Активных СВ", "sum"),
+                    "Активных ТМ": ("Активных ТМ", "sum"),
+                    "Открытых вакансий": ("Открытых вакансий", "sum"),
+                    "Открытых вакансий МЕ": ("Открытых вакансий МЕ", "sum"),
+                    "Открытых вакансий СВ": ("Открытых вакансий СВ", "sum"),
+                    "Приостановленных вакансий": ("Приостановленных вакансий", "sum"),
+                    "Закрытых вакансий": ("Закрытых вакансий", "sum"),
+                    "Успешно закрытых вакансий": ("Успешно закрытых вакансий", "sum"),
+                    "Отмененных вакансий": ("Отмененных вакансий", "sum"),
+                    "Нанято": ("Нанято", "sum"),
+                    "Уволено": ("Уволено", "sum"),
+                },
+            )
+        )
+
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def _build_open_vacancy_monthly(
+    open_vacancies: pd.DataFrame,
+    closed_vacancies: pd.DataFrame | None = None,
+    active_month: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
-    if vacancies.empty or start_col not in vacancies.columns:
+    vacancy_frames: list[pd.DataFrame] = []
+
+    if open_vacancies is not None and not open_vacancies.empty:
+        current = open_vacancies.copy()
+        current["Дата закрытия"] = pd.NaT
+        current["Источник вакансии"] = "текущий список открытых вакансий"
+        vacancy_frames.append(current)
+
+    if closed_vacancies is not None and not closed_vacancies.empty:
+        history = closed_vacancies.copy()
+        history["Приостановлена"] = False
+        history["Источник вакансии"] = "история закрытых вакансий"
+        vacancy_frames.append(history)
+
+    if not vacancy_frames:
         return pd.DataFrame()
 
-    work = vacancies.copy()
-    work[start_col] = pd.to_datetime(work[start_col], errors="coerce")
-    work[end_col] = pd.to_datetime(work[end_col], errors="coerce") if end_col in work.columns else pd.NaT
-    if end_fallback_col and end_fallback_col in work.columns:
-        fallback_end = pd.to_datetime(work[end_fallback_col], errors="coerce")
-        work[end_col] = work[end_col].fillna(fallback_end)
-    work[end_col] = work[end_col].fillna(TODAY)
-    work = work[work[start_col].notna() & work[end_col].notna() & work["Регион BI"].notna()].copy()
-    if work.empty:
-        return pd.DataFrame()
+    work = pd.concat(vacancy_frames, ignore_index=True, sort=False)
+    required_columns = [
+        "ID вакансии",
+        "Дата открытия",
+        "Дата закрытия",
+        "Роль вакансии",
+        "Приостановлена",
+        "Регион BI",
+        "ID территориального менеджера",
+        "Территориальный менеджер",
+        "ID супервайзера",
+        "Супервайзер",
+    ]
+    for column in required_columns:
+        if column not in work.columns:
+            work[column] = pd.NA
 
-    work["StartMonth"] = work[start_col].dt.to_period("M").dt.to_timestamp()
-    end_month = work[end_col].dt.to_period("M").dt.to_timestamp()
-    work["EndMonth"] = end_month if include_end_month else end_month - pd.DateOffset(months=1)
-    work = work[work["EndMonth"].ge(work["StartMonth"])].copy()
-    work["MonthStart"] = work.apply(
-        lambda row: pd.date_range(row["StartMonth"], row["EndMonth"], freq="MS"),
-        axis=1,
-    )
-    work = work.explode("MonthStart").copy()
-    work["YearMonth"] = work["MonthStart"].dt.year * 100 + work["MonthStart"].dt.month
-    work = work.drop_duplicates(["ID вакансии", "MonthStart"])
-    return work
-
-
-def _build_open_vacancy_monthly(open_vacancies: pd.DataFrame, closed_vacancies: pd.DataFrame | None = None) -> pd.DataFrame:
-    if open_vacancies.empty or "Дата открытия" not in open_vacancies.columns:
-        return pd.DataFrame()
-
-    work = open_vacancies.copy()
+    work["ID вакансии"] = work["ID вакансии"].astype("string").str.strip()
+    work["ID вакансии"] = work["ID вакансии"].replace({"": pd.NA, "<NA>": pd.NA, "nan": pd.NA})
     work["Дата открытия"] = pd.to_datetime(work["Дата открытия"], errors="coerce")
-    work = work[work["Дата открытия"].notna() & work["Регион BI"].notna()].copy()
+    work["Дата закрытия"] = pd.to_datetime(work["Дата закрытия"], errors="coerce")
+    work = work[
+        work["ID вакансии"].notna()
+        & work["Дата открытия"].notna()
+        & work["Регион BI"].notna()
+    ].copy()
     if work.empty:
         return pd.DataFrame()
 
-    work["MonthStart"] = work["Дата открытия"].dt.to_period("M").dt.to_timestamp()
-    work["YearMonth"] = work["MonthStart"].dt.year * 100 + work["MonthStart"].dt.month
-    work = work.drop_duplicates(["ID вакансии"]).copy()
-    work["Источник вакансии"] = "открытая вакансия из текущего списка"
-    work["Открытых вакансий"] = 1
-    work["Открытых вакансий МЕ"] = work["Роль вакансии"].eq("МЕ").astype(int)
-    work["Открытых вакансий СВ"] = work["Роль вакансии"].eq("СВ").astype(int)
-    work["Приостановленных вакансий"] = (
-        work["Приостановлена"].fillna(False).astype(int)
-        if "Приостановлена" in work.columns
-        else 0
+    work["_закрыта"] = work["Дата закрытия"].notna().astype(int)
+    work = (
+        work.sort_values(
+            ["ID вакансии", "_закрыта", "Дата закрытия"],
+            na_position="first",
+        )
+        .drop_duplicates("ID вакансии", keep="last")
+        .drop(columns="_закрыта")
     )
-    work["Закрытых вакансий"] = 0
-    work["Успешно закрытых вакансий"] = 0
-    work["Отмененных вакансий"] = 0
-    work["Средний срок закрытия вакансии, дни"] = pd.NA
-    work["Нанято"] = 0
-    work["Уволено"] = 0
-    work["Активных МЕ"] = 0
-    work["Активных СВ"] = 0
-    work["Активных ТМ"] = 0
-    return work
+
+    end_month = pd.to_datetime(
+        active_month if active_month is not None else _latest_source_month(open_vacancies, closed_vacancies),
+        errors="coerce",
+    ).to_period("M").to_timestamp()
+    first_month = pd.Timestamp(
+        year=REPORT_START_YEARMONTH // 100,
+        month=REPORT_START_YEARMONTH % 100,
+        day=1,
+    )
+    if pd.isna(end_month) or end_month < first_month:
+        return pd.DataFrame()
+
+    monthly_frames: list[pd.DataFrame] = []
+    for month_start in pd.date_range(first_month, end_month, freq="MS"):
+        month_end = month_start + pd.offsets.MonthEnd(0)
+        active_mask = work["Дата открытия"].le(month_end) & (
+            work["Дата закрытия"].isna() | work["Дата закрытия"].gt(month_end)
+        )
+        month_work = work.loc[active_mask].copy()
+        if month_work.empty:
+            continue
+
+        month_work["MonthStart"] = month_start
+        month_work["YearMonth"] = month_start.year * 100 + month_start.month
+        month_work["Источник вакансии"] = "незакрытый остаток на конец месяца"
+        month_work["Открытых вакансий"] = 1
+        month_work["Открытых вакансий МЕ"] = month_work["Роль вакансии"].eq("МЕ").astype(int)
+        month_work["Открытых вакансий СВ"] = month_work["Роль вакансии"].eq("СВ").astype(int)
+        month_work["Приостановленных вакансий"] = (
+            month_work["Приостановлена"].fillna(False).astype(int)
+            if month_start == end_month
+            else 0
+        )
+        month_work["Закрытых вакансий"] = 0
+        month_work["Успешно закрытых вакансий"] = 0
+        month_work["Отмененных вакансий"] = 0
+        month_work["Средний срок закрытия вакансии, дни"] = pd.NA
+        month_work["Нанято"] = 0
+        month_work["Уволено"] = 0
+        month_work["Активных МЕ"] = 0
+        month_work["Активных СВ"] = 0
+        month_work["Активных ТМ"] = 0
+        monthly_frames.append(month_work)
+
+    return pd.concat(monthly_frames, ignore_index=True) if monthly_frames else pd.DataFrame()
 
 
 def _build_reporting_snapshot(snapshot: pd.DataFrame) -> pd.DataFrame:
@@ -290,6 +469,8 @@ def _build_reporting_snapshot(snapshot: pd.DataFrame) -> pd.DataFrame:
         "Доля отмен вакансий %",
         "Доля успешных закрытий %",
         "Доля вакансий к активным МЕ %",
+        "Кадровый отток",
+        "Доля кадрового оттока %",
         "Чистый отток",
         "Баланс персонала",
     ]
@@ -310,6 +491,7 @@ def _build_reporting_snapshot(snapshot: pd.DataFrame) -> pd.DataFrame:
         "Отмененных вакансий",
         "Нанято",
         "Уволено",
+        "Кадровый отток",
         "Чистый отток",
         "Баланс персонала",
     ]
@@ -347,9 +529,12 @@ def build_org_staffing_monthly_snapshot() -> pd.DataFrame:
     closed_vacancies = pd.read_parquet(out_dir / "fact_closed_vacancies.parquet")
     hr = pd.read_parquet(out_dir / "fact_hr_registry.parquet")
 
-    headcount = _build_active_headcount(dim, teams)
+    active_month = _users_snapshot_month()
+    current_headcount = _build_active_headcount(dim, teams, active_month)
+    historical_headcount = _build_historical_headcount(hr, active_month)
+    headcount = pd.concat([historical_headcount, current_headcount], ignore_index=True)
 
-    open_work = _build_open_vacancy_monthly(open_vacancies, closed_vacancies)
+    open_work = _build_open_vacancy_monthly(open_vacancies, closed_vacancies, active_month)
     open_metrics = {
         "Открытых вакансий": ("Открытых вакансий", "sum"),
         "Открытых вакансий МЕ": ("Открытых вакансий МЕ", "sum"),
@@ -397,6 +582,8 @@ def build_org_staffing_monthly_snapshot() -> pd.DataFrame:
     closed_agg = _aggregate_levels(closed_work, closed_metrics)
 
     hires = hr.dropna(subset=["MonthStart найм", "Регион BI"]).copy()
+    if "Учитывать в найме" in hires.columns:
+        hires = hires[hires["Учитывать в найме"].fillna(False).eq(True)].copy()
     hires["MonthStart"] = hires["MonthStart найм"]
     hires["YearMonth"] = hires["YearMonth найм"]
     hires["Нанято"] = 1
@@ -432,6 +619,8 @@ def build_org_staffing_monthly_snapshot() -> pd.DataFrame:
         & hr["MonthStart увольнение"].notna()
         & hr["Регион BI"].notna()
     ].copy()
+    if "Учитывать в увольнении" in fires.columns:
+        fires = fires[fires["Учитывать в увольнении"].fillna(False).eq(True)].copy()
     fires["MonthStart"] = fires["MonthStart увольнение"]
     fires["YearMonth"] = fires["YearMonth увольнение"]
     fires["Нанято"] = 0
@@ -556,9 +745,7 @@ def build_org_staffing_monthly_snapshot() -> pd.DataFrame:
     final_input.loc[sv_mask & final_input["ID территориального менеджера"].isna(), "ID территориального менеджера"] = (
         "NO_TM"
     )
-    final_input.loc[sv_mask & final_input["Территориальный менеджер"].isna(), "Территориальный менеджер"] = (
-        "Вакансия / нет ТМ"
-    )
+    final_input = normalize_confirmed_tm(final_input)
 
     for col in [c for c in keys if c not in ["MonthStart", "YearMonth"]]:
         final_input[col] = final_input[col].fillna(sentinel).astype(str)
@@ -588,17 +775,24 @@ def build_org_staffing_monthly_snapshot() -> pd.DataFrame:
     )
     merged = merged.replace(sentinel, pd.NA)
     merged = merged[merged["Регион BI"].notna()].copy()
+    merged["MonthStart"] = pd.to_datetime(merged["MonthStart"], errors="coerce").dt.normalize()
+    merged = merged[merged["MonthStart"].le(active_month)].copy()
 
     merged["Доля отмен вакансий %"] = merged["Отмененных вакансий"] / merged["Закрытых вакансий"].replace(0, pd.NA)
     merged["Доля успешных закрытий %"] = merged["Успешно закрытых вакансий"] / merged["Закрытых вакансий"].replace(0, pd.NA)
-    merged["Доля вакансий к активным МЕ %"] = merged["Открытых вакансий МЕ"] / merged["Активных МЕ"].replace(0, pd.NA)
+    planned_team_base = (merged["Активных МЕ"] + merged["Открытых вакансий МЕ"]).replace(0, pd.NA)
+    staffing_exposure_base = (merged["Активных МЕ"] + merged["Уволено"]).replace(0, pd.NA)
+    merged["Доля вакансий к активным МЕ %"] = merged["Открытых вакансий МЕ"] / planned_team_base
     merged["Чистый отток"] = merged["Уволено"] - merged["Нанято"]
+    merged["Кадровый отток"] = (merged["Уволено"] - merged["Нанято"]).clip(lower=0)
+    merged["Доля кадрового оттока %"] = merged["Кадровый отток"] / staffing_exposure_base
     merged["Баланс персонала"] = merged["Нанято"] - merged["Уволено"]
     for col in [
         "Средний срок закрытия вакансии, дни",
         "Доля отмен вакансий %",
         "Доля успешных закрытий %",
         "Доля вакансий к активным МЕ %",
+        "Доля кадрового оттока %",
     ]:
         merged[col] = pd.to_numeric(merged[col], errors="coerce")
 
@@ -611,16 +805,9 @@ def build_org_staffing_monthly_snapshot() -> pd.DataFrame:
     save_parquet(merged, str(output))
     report_all = _build_reporting_snapshot(merged)
     report_region = report_all[report_all["Уровень анализа"].eq("Регион")].copy()
-    report_tm = report_all[report_all["Уровень анализа"].eq("ТМ")].copy()
-    report_sv = report_all[report_all["Уровень анализа"].eq("СВ")].copy()
-
     save_parquet(report_region, str(out_dir / "org_staffing_report_snapshot.parquet"))
-    save_parquet(report_tm, str(out_dir / "org_staffing_tm_monthly_snapshot.parquet"))
-    save_parquet(report_sv, str(out_dir / "org_staffing_sv_monthly_snapshot.parquet"))
     print(f"\n  Org staffing snapshot: {len(merged)} строк")
     print(f"  Org staffing report snapshot: {len(report_region)} строк")
-    print(f"  Org staffing TM snapshot: {len(report_tm)} строк")
-    print(f"  Org staffing SV snapshot: {len(report_sv)} строк")
     return merged
 
 

@@ -9,10 +9,17 @@ __pycache__/
 
 # Pytest
 .pytest_cache/
+/.tmp_nuget/
+/tmp_*.py
+/tmp_*.json
 
 # Data files (raw sources and output — not tracked in git)
 data/raw/**
 data/out/**
+data/cache/**
+data/.etl_staging/**
+data/.etl_backup/**
+data/.etl.lock
 
 # Keep folder structure in git
 # (нужно сначала "открыть" сами подпапки, иначе git не спустится внутрь
@@ -21,6 +28,12 @@ data/out/**
 !data/raw/*/
 !data/raw/*/.gitkeep
 !data/out/.gitkeep
+!data/cache/.gitkeep
+
+# Сформированные отчёты могут содержать кадровые и персональные данные
+reports/**
+!reports/.gitkeep
+!reports/powerbi_cleanup_plan.json
 
 # Power BI
 *.pbix

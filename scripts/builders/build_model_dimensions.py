@@ -1,5 +1,6 @@
 import sys
 import pandas as pd
+import pyarrow.parquet as pq
 from pathlib import Path
 
 if __package__ is None or __package__ == "":
@@ -8,12 +9,11 @@ if __package__ is None or __package__ == "":
 from scripts.utils import (
     REGION_SORT_ORDER,
     _canonical_region_group_lookup,
+    get_as_of_date,
     load_settings,
     load_region_map,
     save_parquet,
 )
-
-
 MONTH_SHORT_RU = {
     1: "янв",
     2: "фев",
@@ -44,12 +44,35 @@ MONTH_FULL_RU = {
     12: "декабрь",
 }
 
+DIMENSION_OUTPUTS = {"dMonth.parquet", "dQuarter.parquet", "dRegion.parquet"}
+OPERATIONAL_MONTH_TABLES = {
+    "kpi_fact.parquet",
+    "kpi_employee_monthly_metrics.parquet",
+    "okk_fact.parquet",
+    "page3_merch_monthly_snapshot.parquet",
+    "page5_sv_monthly_snapshot.parquet",
+    "page7_tm_monthly_snapshot.parquet",
+}
+DIMENSION_SOURCE_COLUMNS = {
+    "Активен",
+    "Проект",
+    "Регион BI",
+    "MonthStart",
+    "QuarterStart",
+    "QuarterStart ОЭД",
+}
+
 
 def _collect_parquet_tables(out_dir: Path) -> list[tuple[str, pd.DataFrame]]:
     tables = []
     for path in sorted(out_dir.glob("*.parquet")):
+        if path.name in DIMENSION_OUTPUTS:
+            continue
         try:
-            tables.append((path.name, pd.read_parquet(path)))
+            available = set(pq.ParquetFile(path).schema.names)
+            columns = sorted(DIMENSION_SOURCE_COLUMNS & available)
+            if columns:
+                tables.append((path.name, pd.read_parquet(path, columns=columns)))
         except Exception as exc:
             print(f"  Пропуск {path.name}: {exc}")
     return tables
@@ -118,7 +141,16 @@ def _build_dmonth(tables: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
 
     month_series = pd.concat(month_values, ignore_index=True).dropna().drop_duplicates().sort_values()
     start = month_series.min()
-    end = month_series.max()
+    current_month = get_as_of_date().replace(day=1)
+    end = min(month_series.max(), current_month)
+    operational_month_values = []
+    for name, df in tables:
+        if name in OPERATIONAL_MONTH_TABLES and "MonthStart" in df.columns:
+            operational_month_values.append(pd.to_datetime(df["MonthStart"], errors="coerce"))
+    if operational_month_values:
+        operational_month_series = pd.concat(operational_month_values, ignore_index=True).dropna()
+        if not operational_month_series.empty:
+            end = min(end, operational_month_series.max())
     full_range = pd.date_range(start=start, end=end, freq="MS")
 
     dmonth = pd.DataFrame({"MonthStart": full_range})

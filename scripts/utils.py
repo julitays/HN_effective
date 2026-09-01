@@ -1,4 +1,8 @@
+import os
 import re
+import uuid
+from datetime import date
+from functools import lru_cache
 import yaml
 import pandas as pd
 import pyarrow as pa
@@ -20,10 +24,38 @@ REGION_SORT_ORDER = {
 
 def load_settings(path: str = "config/settings.yml") -> dict:
     with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        settings = yaml.safe_load(f)
+
+    override_out = os.environ.get("HN_OUT_DIR", "").strip()
+    if not override_out:
+        return settings
+
+    configured_out = Path(settings["paths"]["out"])
+    override_root = Path(override_out)
+    settings["paths"]["out"] = str(override_root)
+    for source_config in settings.get("sources", {}).values():
+        if not isinstance(source_config, dict) or "output" not in source_config:
+            continue
+        source_output = Path(source_config["output"])
+        try:
+            relative_output = source_output.relative_to(configured_out)
+        except ValueError:
+            continue
+        source_config["output"] = str(override_root / relative_output)
+    return settings
 
 
-def load_region_map(path: str = REGION_MAP_PATH) -> pd.DataFrame:
+def get_as_of_date() -> pd.Timestamp:
+    """Единая дата расчёта, фиксируемая для воспроизводимого запуска ETL."""
+    raw_value = os.environ.get("HN_AS_OF_DATE", "").strip()
+    if raw_value:
+        parsed = pd.to_datetime(raw_value, errors="raise")
+        return pd.Timestamp(parsed).normalize()
+    return pd.Timestamp(date.today()).normalize()
+
+
+@lru_cache(maxsize=8)
+def _load_region_map_cached(path: str, modified_ns: int) -> pd.DataFrame:
     region_map = pd.read_csv(path, dtype=str).fillna("")
     for col in ["source_region", "canonical_region", "region_group", "comment"]:
         if col not in region_map.columns:
@@ -32,6 +64,27 @@ def load_region_map(path: str = REGION_MAP_PATH) -> pd.DataFrame:
     region_map["canonical_region"] = region_map["canonical_region"].astype(str).str.strip()
     region_map["region_group"] = region_map["region_group"].astype(str).str.strip()
     return region_map
+
+
+def load_region_map(path: str = REGION_MAP_PATH) -> pd.DataFrame:
+    source = Path(path)
+    modified_ns = source.stat().st_mtime_ns
+    return _load_region_map_cached(str(source), modified_ns).copy()
+
+
+@lru_cache(maxsize=8)
+def _region_patterns(path: str, modified_ns: int) -> tuple[tuple[str, str], ...]:
+    region_map = _load_region_map_cached(path, modified_ns)
+    candidates = []
+    for source, canonical in zip(
+        region_map["source_region"],
+        region_map["canonical_region"],
+    ):
+        source_normalized = normalize_text_value(source, upper=True)
+        canonical_normalized = normalize_text_value(canonical)
+        if source_normalized and canonical_normalized:
+            candidates.append((source_normalized, canonical_normalized))
+    return tuple(sorted(candidates, key=lambda item: len(item[0]), reverse=True))
 
 
 def _normalize_region_value(value) -> str | None:
@@ -50,6 +103,14 @@ def normalize_text_value(value, *, upper: bool = False) -> str | None:
         return None
     text = text.replace("Ё", "Е").replace("ё", "е")
     return text.upper() if upper else text
+
+
+def normalize_employee_id(value, *, missing: str | None = "") -> str | None:
+    """Нормализует идентификатор сотрудника без изменения бизнес-значения."""
+    if value is None or pd.isna(value):
+        return missing
+    text = str(value).strip().upper()
+    return text or missing
 
 
 def coerce_bool_like(series: pd.Series) -> pd.Series:
@@ -129,17 +190,11 @@ def canonical_region_from_text(value) -> str | None:
         if pattern in text_norm:
             return canonical
 
-    region_map = load_region_map()
-    candidates: list[tuple[int, str]] = []
-    for _, row in region_map.iterrows():
-        source = normalize_text_value(row.get("source_region"), upper=True)
-        canonical = normalize_text_value(row.get("canonical_region"))
-        if source and canonical and source in text_norm:
-            candidates.append((len(source), canonical))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
+    source = Path(REGION_MAP_PATH)
+    for pattern, canonical in _region_patterns(str(source), source.stat().st_mtime_ns):
+        if pattern in text_norm:
+            return canonical
+    return None
 
 
 def _load_dim_region_map() -> pd.DataFrame:
@@ -295,9 +350,16 @@ def enrich_for_output(df: pd.DataFrame, output_path: str | None = None) -> pd.Da
     return enriched
 
 
-def save_parquet(df: pd.DataFrame, output_path: str) -> None:
+def save_parquet(
+    df: pd.DataFrame,
+    output_path: str,
+    exclude_columns: set[str] | None = None,
+) -> None:
     df = enrich_for_output(df, output_path=output_path)
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    if exclude_columns:
+        df = df.drop(columns=list(exclude_columns), errors="ignore")
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
 
     arrays = []
     names = []
@@ -322,7 +384,12 @@ def save_parquet(df: pd.DataFrame, output_path: str) -> None:
                 arrays.append(pa.array(text, type=pa.string(), from_pandas=True))
 
     table = pa.Table.from_arrays(arrays, names=names)
-    pq.write_table(table, output_path, compression="snappy")
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        pq.write_table(table, temporary, compression="snappy")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
     print(f"  Сохранено: {output_path} ({len(df)} строк)")
 
 
@@ -338,6 +405,7 @@ _RU_TO_EN = {
     "Город":          "city",
     "Регион":         "region",
     "Проект":         "project",
+    "Электронная почта":"email",
     "Группы":         "groups",
     "ID руководителя":"manager_id",
     "Дата приёма":    "hire_date",
@@ -443,6 +511,23 @@ def normalize_person_name(value: str | None) -> str | None:
 def first_notna(series: pd.Series):
     values = series.dropna()
     return values.iloc[0] if not values.empty else pd.NA
+
+
+def mean_numeric(series: pd.Series):
+    values = pd.to_numeric(series, errors="coerce")
+    return values.mean() if values.notna().any() else pd.NA
+
+
+def parse_mixed_date_series(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce", format="mixed", dayfirst=True)
+
+
+def normalized_range_score(series: pd.Series, scale: float) -> float:
+    clean = series.dropna()
+    if len(clean) <= 1:
+        return 0.0
+    value_range = float(clean.max() - clean.min())
+    return max(0.0, min(1.0, value_range / scale))
 
 
 def last_notna(series: pd.Series):

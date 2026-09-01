@@ -2,7 +2,7 @@ import re
 
 import pandas as pd
 from pathlib import Path
-from scripts.utils import load_settings, save_parquet
+from scripts.utils import load_settings, normalize_employee_id, parse_mixed_date_series, save_parquet
 
 
 STATUS_MAP = {
@@ -14,10 +14,7 @@ STATUS_MAP = {
 
 
 def _norm_id(value) -> str | None:
-    if pd.isna(value) or value is None:
-        return None
-    text = str(value).strip().upper()
-    return text or None
+    return normalize_employee_id(value, missing=None)
 
 
 def _parse_test_score(value) -> float | None:
@@ -31,10 +28,6 @@ def _parse_test_score(value) -> float | None:
     if match:
         return round(float(match.group(1)) / 100, 4)
     return None
-
-
-def _parse_date_series(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce", format="mixed", dayfirst=True)
 
 
 def _extract_period(value, fallback_name: str):
@@ -112,13 +105,13 @@ def parse_attestations() -> None:
             "Результат тестирования",
             pd.Series([pd.NA] * len(raw), index=raw.index),
         ).map(_parse_test_score)
-        result["Дата заявки"] = _parse_date_series(
+        result["Дата заявки"] = parse_mixed_date_series(
             raw.get("Дата заявки", pd.Series([pd.NaT] * len(raw), index=raw.index))
         )
-        result["Дата начала"] = _parse_date_series(
+        result["Дата начала"] = parse_mixed_date_series(
             raw.get("Начало обучения", pd.Series([pd.NaT] * len(raw), index=raw.index))
         )
-        result["Дата завершения"] = _parse_date_series(
+        result["Дата завершения"] = parse_mixed_date_series(
             raw.get("Завершение обучения", pd.Series([pd.NaT] * len(raw), index=raw.index))
         )
         result["Файл источник"] = f.name

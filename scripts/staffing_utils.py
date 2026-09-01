@@ -12,6 +12,36 @@ from scripts.utils import (
 )
 
 
+NO_TM_ID = "NO_TM"
+NO_TM_NAME = "Вакансия / нет ТМ"
+NO_SV_ID = "NO_SV"
+
+
+def normalize_confirmed_tm(
+    frame: pd.DataFrame,
+    id_column: str = "ID территориального менеджера",
+    name_column: str = "Территориальный менеджер",
+) -> pd.DataFrame:
+    result = frame.copy()
+    if id_column not in result.columns:
+        result[id_column] = pd.NA
+    if name_column not in result.columns:
+        result[name_column] = pd.NA
+
+    tm_ids = result[id_column].astype("string").str.strip().replace("", pd.NA)
+    tm_names = result[name_column].astype("string").str.strip().replace("", pd.NA)
+    confirmed_vacancy = tm_ids.eq(NO_TM_ID).fillna(False) | tm_names.str.contains(
+        "вакан", case=False, na=False
+    )
+    tm_ids.loc[confirmed_vacancy] = NO_TM_ID
+    tm_names.loc[confirmed_vacancy] = NO_TM_NAME
+    tm_ids.loc[tm_names.isna()] = pd.NA
+
+    result[id_column] = tm_ids
+    result[name_column] = tm_names
+    return result
+
+
 def normalize_name(value) -> str | None:
     text = normalize_text_value(value)
     if not text:
@@ -50,7 +80,7 @@ def parse_bs_owner_name(value) -> str | None:
     return owner
 
 
-def _mode_or_first(series: pd.Series):
+def mode_or_first(series: pd.Series):
     clean = series.dropna()
     if clean.empty:
         return pd.NA
@@ -58,6 +88,32 @@ def _mode_or_first(series: pd.Series):
     if not mode.empty:
         return mode.iloc[0]
     return clean.iloc[0]
+
+
+def mode_or_first_text(series: pd.Series):
+    clean = series.dropna().astype("string").str.strip()
+    clean = clean[clean.ne("")]
+    return mode_or_first(clean)
+
+
+def is_tm_role(value) -> bool:
+    text = str(value or "").strip().casefold()
+    return text in {"tm", "тм", "территориальный менеджер"}
+
+
+def missing_supervisor_key(region, tm_id) -> str:
+    region_text = str(region).strip() if pd.notna(region) and str(region).strip() else "Без региона"
+    tm_text = str(tm_id).strip() if pd.notna(tm_id) and str(tm_id).strip() else NO_TM_ID
+    return f"{NO_SV_ID}|{region_text}|{tm_text}"
+
+
+def missing_supervisor_keys(frame: pd.DataFrame) -> pd.Series:
+    return frame.apply(
+        lambda row: missing_supervisor_key(
+            row.get("Регион BI"), row.get("ID территориального менеджера")
+        ),
+        axis=1,
+    )
 
 
 def _unique_lookup(df: pd.DataFrame, key_col: str, payload_cols: list[str]) -> dict[str, dict[str, Any]]:
@@ -117,11 +173,7 @@ def _is_merch_position(value) -> bool:
 
 def _is_tm_position(value) -> bool:
     text = normalize_text_value(value, upper=True) or ""
-    return (
-        "ТЕРРИТОРИАЛЬНЫЙ" in text
-        or text in {"TM", "RM"}
-        or ("МЕНЕДЖЕР" in text and "СУПЕРВАЙЗЕР" not in text)
-    )
+    return text in {"TM", "ТМ", "ТЕРРИТОРИАЛЬНЫЙ МЕНЕДЖЕР"}
 
 
 def _is_hn_project(df: pd.DataFrame) -> pd.Series:
@@ -302,7 +354,7 @@ def build_staffing_reference(dim_employees: pd.DataFrame, teams: pd.DataFrame) -
                 "Супервайзер": ("Супервайзер", "first"),
                 "ID территориального менеджера": ("ID территориального менеджера", "first"),
                 "Территориальный менеджер": ("Территориальный менеджер", "first"),
-                "Регион BI": ("Регион BI", _mode_or_first),
+                "Регион BI": ("Регион BI", mode_or_first),
             }
         )
         .reset_index()
@@ -317,7 +369,7 @@ def build_staffing_reference(dim_employees: pd.DataFrame, teams: pd.DataFrame) -
                 "Супервайзер": ("Супервайзер", "first"),
                 "ID территориального менеджера": ("ID территориального менеджера", "first"),
                 "Территориальный менеджер": ("Территориальный менеджер", "first"),
-                "Регион BI": ("Регион BI", _mode_or_first),
+                "Регион BI": ("Регион BI", mode_or_first),
             }
         )
         .reset_index()
@@ -330,7 +382,7 @@ def build_staffing_reference(dim_employees: pd.DataFrame, teams: pd.DataFrame) -
         .agg(
             **{
                 "Территориальный менеджер": ("Территориальный менеджер", "first"),
-                "Регион BI": ("Регион BI", _mode_or_first),
+                "Регион BI": ("Регион BI", mode_or_first),
             }
         )
         .reset_index()
@@ -368,19 +420,13 @@ def build_staffing_reference(dim_employees: pd.DataFrame, teams: pd.DataFrame) -
     sv = sv.rename(columns={"employee_id": "ID супервайзера"})
     sv = sv.drop(columns=[c for c in ["Регион BI_team"] if c in sv.columns])
 
-    tm_mask = (
-        people["position"].astype(str).str.lower().str.contains("территориальный", na=False)
-        | people["position"].astype(str).str.lower().str.fullmatch("tm", na=False)
-        | people["position"].astype(str).str.lower().str.fullmatch("rm", na=False)
-        | people["position"].astype(str).str.lower().str.contains("менеджер", na=False)
-    )
+    tm_mask = people["position"].map(_is_tm_position)
     tm = people[tm_mask].copy()
     tm = tm.merge(tm_team, on="employee_id", how="outer", suffixes=("", "_team"))
     tm["Территориальный менеджер"] = tm["full_name"].combine_first(tm["Территориальный менеджер"])
     tm["Регион BI"] = tm["Регион BI_team"].combine_first(tm["Регион BI"])
     tm = tm.rename(columns={"employee_id": "ID территориального менеджера"})
     tm["name_norm"] = tm["Территориальный менеджер"].map(normalize_name)
-    tm["short_name"] = tm["Территориальный менеджер"].map(short_name)
     tm = tm.drop(columns=[c for c in ["Регион BI_team"] if c in tm.columns])
 
     all_me, all_sv = _build_all_users_field_lookup(dim, sv_team, tm_team)
@@ -390,7 +436,7 @@ def build_staffing_reference(dim_employees: pd.DataFrame, teams: pd.DataFrame) -
         .assign(city_norm=active["city"].map(normalize_text_value))
         .dropna(subset=["city_norm", "Регион BI"])
         .groupby("city_norm", dropna=False)["Регион BI"]
-        .agg(_mode_or_first)
+        .agg(mode_or_first)
         .to_dict()
     )
 
@@ -405,19 +451,9 @@ def build_staffing_reference(dim_employees: pd.DataFrame, teams: pd.DataFrame) -
             "name_key",
             ["ID супервайзера", "Супервайзер", "ID территориального менеджера", "Территориальный менеджер", "Регион BI"],
         ),
-        "sv_short_lookup": _unique_lookup(
-            sv.assign(short_key=sv["Супервайзер"].map(short_name)),
-            "short_key",
-            ["ID супервайзера", "Супервайзер", "ID территориального менеджера", "Территориальный менеджер", "Регион BI"],
-        ),
         "tm_full_lookup": _unique_lookup(
             tm.assign(name_key=tm["Территориальный менеджер"].map(normalize_name)),
             "name_key",
-            ["ID территориального менеджера", "Территориальный менеджер", "Регион BI"],
-        ),
-        "tm_short_lookup": _unique_lookup(
-            tm.assign(short_key=tm["Территориальный менеджер"].map(short_name)),
-            "short_key",
             ["ID территориального менеджера", "Территориальный менеджер", "Регион BI"],
         ),
         "me_full_lookup": _unique_lookup(
@@ -425,29 +461,14 @@ def build_staffing_reference(dim_employees: pd.DataFrame, teams: pd.DataFrame) -
             "name_key",
             ["employee_id", "full_name", "ID супервайзера", "Супервайзер", "ID территориального менеджера", "Территориальный менеджер", "Регион BI"],
         ),
-        "me_short_lookup": _unique_lookup(
-            merch.assign(short_key=merch["full_name"].map(short_name)),
-            "short_key",
-            ["employee_id", "full_name", "ID супервайзера", "Супервайзер", "ID территориального менеджера", "Территориальный менеджер", "Регион BI"],
-        ),
         "all_me_full_lookup": _unique_lookup(
             all_me.assign(name_key=all_me["full_name"].map(normalize_name)) if not all_me.empty else all_me,
             "name_key",
             ["employee_id", "full_name", "ID супервайзера", "Супервайзер", "ID территориального менеджера", "Территориальный менеджер", "Регион BI", "Активен USERS"],
         ),
-        "all_me_short_lookup": _unique_lookup(
-            all_me.assign(short_key=all_me["full_name"].map(short_name)) if not all_me.empty else all_me,
-            "short_key",
-            ["employee_id", "full_name", "ID супервайзера", "Супервайзер", "ID территориального менеджера", "Территориальный менеджер", "Регион BI", "Активен USERS"],
-        ),
         "all_sv_full_lookup": _unique_lookup(
             all_sv.assign(name_key=all_sv["full_name"].map(normalize_name)) if not all_sv.empty else all_sv,
             "name_key",
-            ["employee_id", "full_name", "ID супервайзера", "Супервайзер", "ID территориального менеджера", "Территориальный менеджер", "Регион BI", "Активен USERS"],
-        ),
-        "all_sv_short_lookup": _unique_lookup(
-            all_sv.assign(short_key=all_sv["full_name"].map(short_name)) if not all_sv.empty else all_sv,
-            "short_key",
             ["employee_id", "full_name", "ID супервайзера", "Супервайзер", "ID территориального менеджера", "Территориальный менеджер", "Регион BI", "Активен USERS"],
         ),
     }
@@ -476,29 +497,19 @@ def resolve_region(*values, reference: dict[str, Any] | None = None) -> str | No
 
 def match_leader_name(raw_name, reference: dict[str, Any], allow_tm: bool = True) -> dict[str, Any]:
     name_norm = normalize_name(raw_name)
-    short = short_name(raw_name)
     if name_norm and name_norm in reference["sv_full_lookup"]:
         row = reference["sv_full_lookup"][name_norm].copy()
         row["match_type"] = "sv_full"
         return row
-    if short and short in reference["sv_short_lookup"]:
-        row = reference["sv_short_lookup"][short].copy()
-        row["match_type"] = "sv_short"
-        return row
     if allow_tm and name_norm and name_norm in reference["tm_full_lookup"]:
         row = reference["tm_full_lookup"][name_norm].copy()
         row["match_type"] = "tm_full"
-        return row
-    if allow_tm and short and short in reference["tm_short_lookup"]:
-        row = reference["tm_short_lookup"][short].copy()
-        row["match_type"] = "tm_short"
         return row
     return {}
 
 
 def match_employee_name(raw_name, role: str, reference: dict[str, Any]) -> dict[str, Any]:
     name_norm = normalize_name(raw_name)
-    short = short_name(raw_name)
 
     if role == "СВ":
         row = match_leader_name(raw_name, reference, allow_tm=True)
@@ -506,9 +517,6 @@ def match_employee_name(raw_name, role: str, reference: dict[str, Any]) -> dict[
         if name_norm and name_norm in reference["all_sv_full_lookup"]:
             fallback = reference["all_sv_full_lookup"][name_norm].copy()
             fallback["match_type"] = "all_users_sv_full"
-        elif short and short in reference["all_sv_short_lookup"]:
-            fallback = reference["all_sv_short_lookup"][short].copy()
-            fallback["match_type"] = "all_users_sv_short"
         return _merge_match(row, fallback)
 
     if role == "МЕ":
@@ -516,17 +524,11 @@ def match_employee_name(raw_name, role: str, reference: dict[str, Any]) -> dict[
         if name_norm and name_norm in reference["me_full_lookup"]:
             row = reference["me_full_lookup"][name_norm].copy()
             row["match_type"] = "me_full"
-        elif short and short in reference["me_short_lookup"]:
-            row = reference["me_short_lookup"][short].copy()
-            row["match_type"] = "me_short"
 
         fallback = {}
         if name_norm and name_norm in reference["all_me_full_lookup"]:
             fallback = reference["all_me_full_lookup"][name_norm].copy()
             fallback["match_type"] = "all_users_me_full"
-        elif short and short in reference["all_me_short_lookup"]:
-            fallback = reference["all_me_short_lookup"][short].copy()
-            fallback["match_type"] = "all_users_me_short"
         if row or fallback:
             return _merge_match(row, fallback)
 
@@ -563,15 +565,16 @@ def attach_last_quarter_metric(
     monthly_base: pd.DataFrame,
     quarterly_df: pd.DataFrame,
     value_col: str,
+    period: str = "quarter",
 ) -> pd.DataFrame:
-    """К каждому месяцу региона подтягивает последнее известное квартальное значение."""
+    """К каждому месяцу региона подтягивает значение только внутри согласованного периода."""
     if quarterly_df.empty:
         monthly_base[value_col] = pd.NA
         return monthly_base
 
     pieces = []
     for region, region_base in monthly_base.groupby("Регион BI", dropna=False):
-        base_sorted = region_base.sort_values("MonthStart").copy()
+        base_sorted = region_base.sort_values("MonthStart").reset_index(drop=True).copy()
         quarter_sorted = quarterly_df[quarterly_df["Регион BI"] == region].sort_values("QuarterStart").copy()
         if quarter_sorted.empty:
             base_sorted[value_col] = pd.NA
@@ -583,7 +586,13 @@ def attach_last_quarter_metric(
                 right_on="QuarterStart",
                 direction="backward",
             )
-            base_sorted[value_col] = merged[value_col].values
+            month_start = pd.to_datetime(base_sorted["MonthStart"], errors="coerce")
+            matched_quarter = pd.to_datetime(merged["QuarterStart"], errors="coerce")
+            if period == "year":
+                valid_period = matched_quarter.dt.year.eq(month_start.dt.year)
+            else:
+                valid_period = matched_quarter.dt.to_period("Q").eq(month_start.dt.to_period("Q"))
+            base_sorted[value_col] = merged[value_col].where(valid_period, pd.NA).values
         pieces.append(base_sorted)
 
     return pd.concat(pieces, ignore_index=True)

@@ -4,13 +4,13 @@ from pathlib import Path
 import pandas as pd
 
 if __package__ is None or __package__ == "":
-    sys.path.append(str(Path(__file__).resolve().parents[1]))
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from scripts.utils import load_settings, save_parquet, normalize_pct as _normalize_pct
 
 
 TARGET_KPI = 0.75
-TARGET_OKK = 0.60
+TARGET_KPI_CURRENT = 0.95
 TARGET_OSA = 0.85
 TARGET_PICOS = 0.85
 TARGET_PHOTO = 0.75
@@ -101,15 +101,15 @@ def _build_block_anomalies(
             if not region_row.empty:
                 worst["KPI проекта %"] = region_row["KPI проекта %"].iloc[0]
                 worst["Фрод %"] = region_row["Фрод %"].iloc[0]
-                worst["KPI-разрыв %"] = (
-                    float(region_row["KPI проекта %"].iloc[0]) - TARGET_KPI
+                worst["Просадка KPI %"] = (
+                    max(0.0, TARGET_KPI_CURRENT - float(region_row["KPI проекта %"].iloc[0]))
                     if pd.notna(region_row["KPI проекта %"].iloc[0])
                     else pd.NA
                 )
             else:
                 worst["KPI проекта %"] = pd.NA
                 worst["Фрод %"] = pd.NA
-                worst["KPI-разрыв %"] = pd.NA
+                worst["Просадка KPI %"] = pd.NA
             worst["Зона"] = worst["Регион BI"]
             rows.append(worst)
 
@@ -122,7 +122,7 @@ def _build_block_anomalies(
             "Метрика",
             "ОКК %",
             "KPI проекта %",
-            "KPI-разрыв %",
+            "Просадка KPI %",
             "Фрод %",
             "Зона",
         ]
@@ -205,6 +205,15 @@ def _build_signals(
                 .dropna()
                 .mode()
             )
+            fraud_count = float(top_sv["Фрод кол-во"])
+            if fraud_count >= 5:
+                fraud_risk = "Критично"
+            elif fraud_count >= 2:
+                fraud_risk = "Высокий риск"
+            else:
+                # 0-1 нарушение — это ещё не "повторяется", спокойный уровень
+                # (как у остальных 3 сигналов в этой функции)
+                fraud_risk = "Контроль"
             rows.append(
                 {
                     "MonthStart": month_start,
@@ -212,7 +221,7 @@ def _build_signals(
                     "Регион BI": sv_region.iloc[0] if not sv_region.empty else pd.NA,
                     "Сигнал": "Фрод повторяется у СВ",
                     "Объект": sv_name if pd.notna(sv_name) else "СВ",
-                    "Риск": "Критично" if float(top_sv["Фрод кол-во"]) >= 5 else "Высокий риск",
+                    "Риск": fraud_risk,
                     "Действие": "аудит контроля",
                 }
             )
@@ -325,7 +334,7 @@ def _build_insights_monthly(
     anomaly["Категория"] = anomaly["Блок"]
     anomaly["Показатель"] = anomaly["Метрика"]
     anomaly["% из проверок ОКК"] = anomaly["ОКК %"]
-    anomaly["KPI-разрыв %"] = anomaly["KPI-разрыв %"]
+    anomaly["Просадка KPI %"] = anomaly["Просадка KPI %"]
     anomaly["Объект"] = anomaly["Зона"]
     anomaly["Просадка ОКК %"] = pd.NA
     anomaly["Доля нарушения %"] = pd.NA
@@ -338,7 +347,7 @@ def _build_insights_monthly(
     impact_df["Категория"] = "Нарушение"
     impact_df["Показатель"] = impact_df["Нарушение"]
     impact_df["% из проверок ОКК"] = pd.NA
-    impact_df["KPI-разрыв %"] = pd.NA
+    impact_df["Просадка KPI %"] = pd.NA
     impact_df["Фрод %"] = pd.NA
     impact_df["Объект"] = impact_df["Регион BI"]
     impact_df["Риск"] = pd.NA
@@ -350,7 +359,7 @@ def _build_insights_monthly(
     signal["Категория"] = signal["Сигнал"]
     signal["Показатель"] = signal["Сигнал"]
     signal["% из проверок ОКК"] = pd.NA
-    signal["KPI-разрыв %"] = pd.NA
+    signal["Просадка KPI %"] = pd.NA
     signal["Фрод %"] = pd.NA
     signal["Просадка ОКК %"] = pd.NA
     signal["Доля нарушения %"] = pd.NA
@@ -364,7 +373,7 @@ def _build_insights_monthly(
         "Категория",
         "Показатель",
         "% из проверок ОКК",
-        "KPI-разрыв %",
+        "Просадка KPI %",
         "Фрод %",
         "Просадка ОКК %",
         "Доля нарушения %",
@@ -389,7 +398,6 @@ def build_page6_okk_fraud_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     okk = pd.read_parquet(out_dir / "okk_fact.parquet")
     region_snapshot = pd.read_parquet(out_dir / "page1_region_monthly_snapshot.parquet")
     d_supervisor = pd.read_parquet(out_dir / "dSupervisor.parquet")
-
     region_trend = _build_region_trend(okk, region_snapshot)
     block_anomalies = _build_block_anomalies(okk, region_trend)
     impact = _build_violation_impact(okk)
@@ -403,7 +411,7 @@ def build_page6_okk_fraud_data() -> tuple[pd.DataFrame, pd.DataFrame]:
         ),
         (
             insights,
-            ["YearMonth", "% из проверок ОКК", "KPI-разрыв %", "Фрод %", "Просадка ОКК %", "Доля нарушения %", "Порядок"],
+            ["YearMonth", "% из проверок ОКК", "Просадка KPI %", "Фрод %", "Просадка ОКК %", "Доля нарушения %", "Порядок"],
         ),
     ]:
         for column in numeric_columns:

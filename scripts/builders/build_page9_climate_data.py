@@ -68,6 +68,27 @@ def _status_from_row(row: pd.Series) -> str:
     return "стабильно"
 
 
+def _active_report_regions(out_dir: Path) -> set[str]:
+    dregion_path = out_dir / "dRegion.parquet"
+    if dregion_path.exists():
+        dregion = pd.read_parquet(dregion_path)
+        if "Регион BI" in dregion.columns:
+            return set(dregion["Регион BI"].dropna().astype(str).str.strip())
+
+    dim_path = out_dir / "dim_employees.parquet"
+    if not dim_path.exists():
+        return set()
+    dim = pd.read_parquet(dim_path)
+    required = {"Активен", "Проект", "Регион BI"}
+    if not required.issubset(dim.columns):
+        return set()
+    active = dim[
+        dim["Активен"].fillna(False).eq(True)
+        & dim["Проект"].astype(str).eq("H&N")
+    ].copy()
+    return set(active["Регион BI"].dropna().astype(str).str.strip())
+
+
 def _build_quarterly_region_base(enps: pd.DataFrame) -> pd.DataFrame:
     work = enps[enps["QuarterStart"].notna()].copy()
     work = work[work["Регион BI"].notna()].copy()
@@ -172,7 +193,7 @@ def _build_blocks(enps: pd.DataFrame) -> pd.DataFrame:
         return result, result
 
     result["Предыдущий период %"] = result.groupby(["Регион BI", "Блок"], dropna=False)["Значение %"].shift(1)
-    result["Δ к предыдущему, п.п."] = result["Значение %"] - result["Предыдущий период %"]
+    result["Изменение к предыдущему %"] = result["Значение %"] - result["Предыдущий период %"]
     return result.sort_values(["QuarterStart", "Регион BI", "Порядок блока"]).reset_index(drop=True)
 
 
@@ -183,6 +204,9 @@ def build_page9_climate_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     enps = pd.read_parquet(out_dir / "enps_fact.parquet")
 
     quarterly_region = _build_quarterly_region_base(enps)
+    active_regions = _active_report_regions(out_dir)
+    if active_regions:
+        quarterly_region = quarterly_region[quarterly_region["Регион BI"].astype(str).isin(active_regions)].copy()
     quarterly_region["Статус"] = quarterly_region.apply(
         lambda row: _status_from_row(row) if pd.notna(row.get("Ответов")) and int(row.get("Ответов")) >= MIN_REGION_RESPONSES else pd.NA,
         axis=1,
@@ -190,6 +214,8 @@ def build_page9_climate_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     quarterly_region = quarterly_region.sort_values(["QuarterStart", "Регион BI"]).reset_index(drop=True)
 
     blocks_region = _build_blocks(enps)
+    if active_regions and not blocks_region.empty:
+        blocks_region = blocks_region[blocks_region["Регион BI"].astype(str).isin(active_regions)].copy()
 
     save_parquet(quarterly_region, str(out_dir / "page9_climate_quarterly_region.parquet"))
     save_parquet(blocks_region, str(out_dir / "page9_climate_blocks_region.parquet"))

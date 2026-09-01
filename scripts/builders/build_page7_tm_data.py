@@ -14,10 +14,13 @@ from scripts.utils import (
     first_notna as _first_notna,
 )
 from scripts.staffing_utils import (
-    _mode_or_first,
+    is_tm_role as _is_tm_role,
+    mode_or_first as _mode_or_first,
+    normalize_confirmed_tm,
     score_higher_is_better as _score_higher_is_better,
     score_lower_is_better as _score_lower_is_better,
 )
+from scripts.kpi_metric_utils import KPI_SCORE_WEIGHT_COLUMNS, aggregate_employee_kpi_to_org
 
 
 REPORT_START_YEAR = load_settings()["reporting"]["start_yearmonth"] // 100
@@ -35,26 +38,33 @@ TM_EFFECTIVENESS_WEIGHTS = {
     "Текучесть %": 0.05,
 }
 TM_SIGNAL_WEIGHTS = {
-    "KPI месяца территории": TM_EFFECTIVENESS_WEIGHTS["KPI месяца территории %"],
     "Качество команды": TM_EFFECTIVENESS_WEIGHTS["Качество команды %"],
     "Обучение команды": TM_EFFECTIVENESS_WEIGHTS["Обучение команды %"],
     "Фрод": TM_EFFECTIVENESS_WEIGHTS["Фрод %"],
     "Стабильность команды": TM_EFFECTIVENESS_WEIGHTS["Стабильность команды %"],
     "Текучесть": TM_EFFECTIVENESS_WEIGHTS["Текучесть %"],
 }
-TM_EFFECTIVENESS_CRITICAL_COLUMNS = ["KPI месяца территории %", "Качество команды %"]
+TM_KPI_COMPONENTS = {
+    "PICOS": ("PICOS выполнение %", "PICOS вес в KPI %", 0.98),
+    "OSA": ("OSA выполнение %", "OSA вес в KPI %", 0.95),
+    "TOP16": ("TOP16 выполнение %", "TOP16 вес в KPI %", 0.95),
+}
+TM_EFFECTIVENESS_CRITICAL_COLUMNS = [
+    "KPI месяца территории %",
+    "Целевой порог KPI территории %",
+]
 
 TM_MIN_AVAILABLE_WEIGHT = 0.60
 TM_STABLE_MIN_SCORE = 0.90
 TM_CONTROL_MIN_SCORE = 0.80
-TM_KPI_GREEN_MIN = 0.95
-TM_KPI_RED_MIN = 0.90
-TM_QUALITY_GREEN_MIN = 0.80
-TM_QUALITY_RED_MIN = 0.70
-TM_LEARNING_GREEN_MIN = 0.95
-TM_LEARNING_RED_MIN = 0.90
-TM_FRAUD_GREEN_MAX = 0.10
-TM_FRAUD_RED_MAX = 0.18
+TM_KPI_GREEN_MIN = 0.99
+TM_KPI_RED_MIN = 0.95
+TM_QUALITY_GREEN_MIN = 0.60
+TM_QUALITY_RED_MIN = 0.40
+TM_LEARNING_GREEN_MIN = 0.90
+TM_LEARNING_RED_MIN = 0.80
+TM_FRAUD_GREEN_MAX = 0.15
+TM_FRAUD_RED_MAX = 0.20
 TM_STABILITY_GREEN_MIN = 0.95
 TM_STABILITY_RED_MIN = 0.90
 TM_TURNOVER_GREEN_MAX = 0.10
@@ -153,6 +163,66 @@ def _tm_available_weight_from_row(row: pd.Series) -> float:
     return sum(weight for column, weight in TM_EFFECTIVENESS_WEIGHTS.items() if pd.notna(row.get(column)))
 
 
+def _tm_kpi_target_from_row(row: pd.Series):
+    weighted_target = 0.0
+    total_weight = 0.0
+    for _, (value_column, weight_column, green_target) in TM_KPI_COMPONENTS.items():
+        value = pd.to_numeric(row.get(value_column), errors="coerce")
+        weight = pd.to_numeric(row.get(weight_column), errors="coerce")
+        if pd.isna(weight) or float(weight) <= 0:
+            continue
+        if pd.isna(value):
+            return pd.NA
+        weighted_target += float(weight) * green_target
+        total_weight += float(weight)
+    if total_weight <= 0:
+        return pd.NA
+    return weighted_target / total_weight
+
+
+def _tm_kpi_score_from_row(row: pd.Series, weight: float):
+    return _score_higher_is_better(
+        row.get("KPI месяца территории %"),
+        row.get("Целевой порог KPI территории %"),
+        TM_KPI_RED_MIN,
+        weight,
+    )
+
+
+def _tm_operational_result_from_row(row: pd.Series):
+    if pd.isna(row.get("KPI месяца территории %")) or pd.isna(row.get("Целевой порог KPI территории %")):
+        return pd.NA
+    available_values = [
+        (row.get("KPI месяца территории %"), TM_OPERATIONAL_KPI_WEIGHT),
+        (row.get("Качество команды %"), TM_OPERATIONAL_QUALITY_WEIGHT),
+        (row.get("Обучение команды %"), TM_OPERATIONAL_LEARNING_WEIGHT),
+        (row.get("Фрод %"), TM_OPERATIONAL_ANTIFRAUD_WEIGHT),
+    ]
+    available_weight = _available_weight(available_values)
+    if available_weight < TM_MIN_AVAILABLE_WEIGHT:
+        return pd.NA
+    score = _tm_kpi_score_from_row(row, TM_OPERATIONAL_KPI_WEIGHT)
+    score += _score_higher_is_better(
+        row.get("Качество команды %"),
+        TM_QUALITY_GREEN_MIN,
+        TM_QUALITY_RED_MIN,
+        TM_OPERATIONAL_QUALITY_WEIGHT,
+    )
+    score += _score_higher_is_better(
+        row.get("Обучение команды %"),
+        TM_LEARNING_GREEN_MIN,
+        TM_LEARNING_RED_MIN,
+        TM_OPERATIONAL_LEARNING_WEIGHT,
+    )
+    score += _score_lower_is_better(
+        row.get("Фрод %"),
+        TM_FRAUD_GREEN_MAX,
+        TM_FRAUD_RED_MAX,
+        TM_OPERATIONAL_ANTIFRAUD_WEIGHT,
+    )
+    return round(max(0.0, min(1.0, score / available_weight)), 4)
+
+
 def _tm_effectiveness_score_from_row(row: pd.Series):
     available_weight = _tm_available_weight_from_row(row)
     if available_weight < TM_MIN_AVAILABLE_WEIGHT:
@@ -161,10 +231,8 @@ def _tm_effectiveness_score_from_row(row: pd.Series):
         return pd.NA
 
     score = 0.0
-    score += _score_higher_is_better(
-        row.get("KPI месяца территории %"),
-        TM_KPI_GREEN_MIN,
-        TM_KPI_RED_MIN,
+    score += _tm_kpi_score_from_row(
+        row,
         TM_EFFECTIVENESS_WEIGHTS["KPI месяца территории %"],
     )
     score += _score_higher_is_better(
@@ -197,7 +265,6 @@ def _tm_effectiveness_score_from_row(row: pd.Series):
         TM_TURNOVER_RED_MAX,
         TM_EFFECTIVENESS_WEIGHTS["Текучесть %"],
     )
-    score = score / available_weight if available_weight > 0 else pd.NA
     return round(max(0.0, min(1.0, score)), 4)
 
 
@@ -283,31 +350,29 @@ def _build_unassigned_hr_flow_by_month(hr: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _role_priority(value: str | None) -> int:
-    text = str(value or "").strip().lower()
-    if text == "tm":
-        return 1
-    if text == "rm":
-        return 2
-    if "старший менеджер" in text:
-        return 3
-    if "ведущий менеджер" in text:
-        return 4
-    if "менеджер" in text:
-        return 5
-    if "супервайзер" in text:
-        return 6
-    return 9
+def _active_tm_ids(dim_employees: pd.DataFrame) -> set[str]:
+    if dim_employees.empty or not {"ID сотрудника", "Должность", "Активен"}.issubset(dim_employees.columns):
+        return set()
+    dim = dim_employees.copy()
+    dim["ID сотрудника"] = dim["ID сотрудника"].replace("", pd.NA)
+    active_mask = dim["Активен"].fillna(False).eq(True)
+    tm_mask = dim["Должность"].map(_is_tm_role)
+    return set(dim.loc[active_mask & tm_mask, "ID сотрудника"].dropna().astype(str).str.strip())
+
+
+def _clear_unconfirmed_tm(teams_work: pd.DataFrame, valid_tm_ids: set[str]) -> pd.DataFrame:
+    teams_work = teams_work.copy()
+    teams_work["ID территориального менеджера"] = teams_work["ID территориального менеджера"].replace("", pd.NA)
+    tm_ids = teams_work["ID территориального менеджера"].astype("string").str.strip()
+    invalid_tm = tm_ids.notna() & ~tm_ids.isin(valid_tm_ids) & tm_ids.ne(NO_TM_ID)
+    teams_work.loc[invalid_tm, "ID территориального менеджера"] = pd.NA
+    teams_work.loc[invalid_tm, "Территориальный менеджер"] = pd.NA
+    return normalize_confirmed_tm(teams_work)
 
 
 def _build_tm_directory(dim_employees: pd.DataFrame, teams: pd.DataFrame) -> pd.DataFrame:
-    teams_work = teams.replace("", pd.NA).copy()
-    teams_work["ID территориального менеджера"] = (
-        teams_work["ID территориального менеджера"].replace("", pd.NA).fillna(NO_TM_ID)
-    )
-    teams_work["Территориальный менеджер"] = (
-        teams_work["Территориальный менеджер"].replace("", pd.NA).fillna(NO_TM_NAME)
-    )
+    valid_tm_ids = _active_tm_ids(dim_employees)
+    teams_work = _clear_unconfirmed_tm(teams.replace("", pd.NA), valid_tm_ids)
     teams_tm = (
         teams_work.groupby("ID территориального менеджера", dropna=False)
         .agg(
@@ -351,7 +416,12 @@ def _build_tm_directory(dim_employees: pd.DataFrame, teams: pd.DataFrame) -> pd.
     )
 
     directory = teams_tm.merge(dim, on="ID территориального менеджера", how="left")
+    directory = directory[
+        directory["ID территориального менеджера"].eq(NO_TM_ID)
+        | directory["ID территориального менеджера"].astype(str).str.strip().isin(valid_tm_ids)
+    ].copy()
     directory["Территориальный менеджер"] = directory["Территориальный менеджер"].combine_first(directory["Территориальный менеджер dim"])
+    directory.loc[directory["ID территориального менеджера"].eq(NO_TM_ID), "Территориальный менеджер"] = NO_TM_NAME
     directory["TM short"] = directory["Территориальный менеджер"].map(_short_name)
     directory = directory.drop(columns=["Территориальный менеджер dim", "Регион BI dim", "Группа региона dim"], errors="ignore")
     directory = directory.drop_duplicates("ID территориального менеджера")
@@ -376,21 +446,17 @@ def _build_sv_tm_map(
     tm_directory: pd.DataFrame,
     month_calendar: pd.DataFrame,
 ) -> pd.DataFrame:
+    valid_tm_ids = set(tm_directory["ID территориального менеджера"].dropna().astype(str).str.strip())
+    teams_work = _clear_unconfirmed_tm(teams.replace("", pd.NA), valid_tm_ids)
     sv_list = (
-        teams.replace("", pd.NA)[["ID супервайзера"]]
+        teams_work[["ID супервайзера"]]
         .dropna(subset=["ID супервайзера"])
         .drop_duplicates()
     )
     sv_months = _cross_join_months(sv_list, month_calendar[["MonthStart", "YearMonth"]].drop_duplicates())
     current = (
-        teams.replace("", pd.NA)
+        teams_work
         .dropna(subset=["ID супервайзера"])
-        .assign(
-            **{
-                "ID территориального менеджера": lambda df: df["ID территориального менеджера"].fillna(NO_TM_ID),
-                "Территориальный менеджер": lambda df: df["Территориальный менеджер"].fillna(NO_TM_NAME),
-            }
-        )
         .groupby("ID супервайзера", dropna=False)
         .agg(
             **{
@@ -420,21 +486,17 @@ def _build_me_tm_map(
     tm_directory: pd.DataFrame,
     month_calendar: pd.DataFrame,
 ) -> pd.DataFrame:
+    valid_tm_ids = set(tm_directory["ID территориального менеджера"].dropna().astype(str).str.strip())
+    teams_work = _clear_unconfirmed_tm(teams.replace("", pd.NA), valid_tm_ids)
     me_list = (
-        teams.replace("", pd.NA)[["ID мерчендайзера"]]
+        teams_work[["ID мерчендайзера"]]
         .dropna(subset=["ID мерчендайзера"])
         .drop_duplicates()
     )
     me_months = _cross_join_months(me_list, month_calendar[["MonthStart", "YearMonth"]].drop_duplicates())
     current = (
-        teams.replace("", pd.NA)
+        teams_work
         .dropna(subset=["ID мерчендайзера"])
-        .assign(
-            **{
-                "ID территориального менеджера": lambda df: df["ID территориального менеджера"].fillna(NO_TM_ID),
-                "Территориальный менеджер": lambda df: df["Территориальный менеджер"].fillna(NO_TM_NAME),
-            }
-        )
         .groupby("ID мерчендайзера", dropna=False)
         .agg(
             **{
@@ -457,6 +519,71 @@ def _build_me_tm_map(
     result["Регион BI"] = result["Регион BI"].combine_first(result["Регион BI_tm"])
     result["Группа региона"] = result["Группа региона"].combine_first(result["Группа региона_tm"])
     return result.drop(columns=["Регион BI_tm", "Группа региона_tm"], errors="ignore")
+
+
+def _build_source_entity_tm_map(
+    source: pd.DataFrame,
+    entity_column: str,
+    tm_directory: pd.DataFrame,
+) -> pd.DataFrame:
+    required = {
+        "MonthStart",
+        "YearMonth",
+        entity_column,
+        "ID территориального менеджера",
+        "Территориальный менеджер",
+        "Регион BI",
+    }
+    if source is None or source.empty or not required.issubset(source.columns):
+        return pd.DataFrame(columns=[*required, "Код ТМ", "ТМ / Объект", "Группа региона"])
+    work = source[[column for column in [*required, "Группа региона"] if column in source.columns]].copy()
+    work = work.replace("", pd.NA).dropna(subset=["MonthStart", "YearMonth", entity_column])
+    work = work[
+        work["ID территориального менеджера"].notna()
+        & work["ID территориального менеджера"].astype(str).ne(NO_TM_ID)
+    ].copy()
+    if work.empty:
+        return pd.DataFrame(columns=[*required, "Код ТМ", "ТМ / Объект", "Группа региона"])
+
+    keys = ["MonthStart", "YearMonth", entity_column]
+    tm_count = work.groupby(keys)["ID территориального менеджера"].transform("nunique")
+    work = work[tm_count.eq(1)].copy()
+    result = (
+        work.groupby(keys, dropna=False)
+        .agg(
+            **{
+                "ID территориального менеджера": ("ID территориального менеджера", _mode_or_first),
+                "Территориальный менеджер": ("Территориальный менеджер", _mode_or_first),
+                "Регион BI": ("Регион BI", _mode_or_first),
+                "Группа региона": ("Группа региона", _mode_or_first) if "Группа региона" in work.columns else ("Регион BI", lambda _: pd.NA),
+            }
+        )
+        .reset_index()
+    )
+    result = result.merge(
+        tm_directory[["ID территориального менеджера", "Код ТМ", "ТМ / Объект"]],
+        on="ID территориального менеджера",
+        how="left",
+    )
+    result["ТМ / Объект"] = result["ТМ / Объект"].combine_first(result["Территориальный менеджер"])
+    return result
+
+
+def _append_missing_entity_mapping(
+    primary: pd.DataFrame,
+    fallback: pd.DataFrame,
+    entity_column: str,
+) -> pd.DataFrame:
+    keys = ["MonthStart", "YearMonth", entity_column]
+    if fallback is None or fallback.empty:
+        return primary
+    if primary is None or primary.empty:
+        return fallback.copy()
+
+    existing = primary[keys].drop_duplicates()
+    missing = fallback.merge(existing, on=keys, how="left", indicator=True)
+    missing = missing[missing["_merge"].eq("left_only")].drop(columns="_merge")
+    return pd.concat([primary, missing], ignore_index=True, sort=False)
 
 
 def _build_tm_learning_monthly(learning_fact: pd.DataFrame, team_member_tm_map: pd.DataFrame) -> pd.DataFrame:
@@ -605,7 +732,6 @@ def _build_tm_personal_learning_monthly(
 
 
 def _tm_metric_signal_records(row: pd.Series) -> list[dict]:
-    kpi = row.get("KPI месяца территории %")
     quality = row.get("Качество команды %")
     learning = row.get("Обучение команды %")
     fraud_pct = row.get("Фрод %")
@@ -614,8 +740,8 @@ def _tm_metric_signal_records(row: pd.Series) -> list[dict]:
 
     records: list[dict] = []
 
-    def add_signal(metric: str, level: str, order: int):
-        weight = TM_SIGNAL_WEIGHTS[metric]
+    def add_signal(metric: str, level: str, order: int, weight: float | None = None):
+        weight = TM_SIGNAL_WEIGHTS[metric] if weight is None else weight
         severity = 1.0 if level == "hard" else 0.5
         records.append(
             {
@@ -627,41 +753,51 @@ def _tm_metric_signal_records(row: pd.Series) -> list[dict]:
             }
         )
 
-    if pd.notna(kpi):
-        if float(kpi) < TM_KPI_RED_MIN:
-            add_signal("KPI месяца территории", "hard", 1)
-        elif float(kpi) < TM_KPI_GREEN_MIN:
-            add_signal("KPI месяца территории", "soft", 1)
+    active_kpi_components = [
+        (label, pd.to_numeric(row.get(value_column), errors="coerce"), green_target)
+        for label, (value_column, _, green_target) in TM_KPI_COMPONENTS.items()
+        if pd.notna(pd.to_numeric(row.get(value_column), errors="coerce"))
+    ]
+    kpi_signal_weight = (
+        TM_EFFECTIVENESS_WEIGHTS["KPI месяца территории %"] / len(active_kpi_components)
+        if active_kpi_components
+        else 0.0
+    )
+    for order, (label, value, green_target) in enumerate(active_kpi_components, start=1):
+        if float(value) < TM_KPI_RED_MIN:
+            add_signal(label, "hard", order, kpi_signal_weight)
+        elif float(value) < green_target:
+            add_signal(label, "soft", order, kpi_signal_weight)
 
     if pd.notna(quality):
         if float(quality) < TM_QUALITY_RED_MIN:
-            add_signal("Качество команды", "hard", 2)
+            add_signal("Качество команды", "hard", 4)
         elif float(quality) < TM_QUALITY_GREEN_MIN:
-            add_signal("Качество команды", "soft", 2)
+            add_signal("Качество команды", "soft", 4)
 
     if pd.notna(learning):
         if float(learning) < TM_LEARNING_RED_MIN:
-            add_signal("Обучение команды", "hard", 3)
+            add_signal("Обучение команды", "hard", 5)
         elif float(learning) < TM_LEARNING_GREEN_MIN:
-            add_signal("Обучение команды", "soft", 3)
+            add_signal("Обучение команды", "soft", 5)
 
     if pd.notna(fraud_pct):
         if float(fraud_pct) > TM_FRAUD_RED_MAX:
-            add_signal("Фрод", "hard", 4)
+            add_signal("Фрод", "hard", 6)
         elif float(fraud_pct) > TM_FRAUD_GREEN_MAX:
-            add_signal("Фрод", "soft", 4)
+            add_signal("Фрод", "soft", 6)
 
     if pd.notna(team_stability):
         if float(team_stability) < TM_STABILITY_RED_MIN:
-            add_signal("Стабильность команды", "hard", 5)
+            add_signal("Стабильность команды", "hard", 7)
         elif float(team_stability) < TM_STABILITY_GREEN_MIN:
-            add_signal("Стабильность команды", "soft", 5)
+            add_signal("Стабильность команды", "soft", 7)
 
     if pd.notna(turnover):
         if float(turnover) > TM_TURNOVER_RED_MAX:
-            add_signal("Текучесть", "hard", 6)
+            add_signal("Текучесть", "hard", 8)
         elif float(turnover) > TM_TURNOVER_GREEN_MAX:
-            add_signal("Текучесть", "soft", 6)
+            add_signal("Текучесть", "soft", 8)
 
     return records
 
@@ -692,14 +828,6 @@ def _tm_signal_weight_summary(row: pd.Series) -> pd.Series:
     )
 
 
-def _tm_weak_metrics_in_order(row: pd.Series) -> list[str]:
-    records = sorted(
-        _tm_metric_signal_records(row),
-        key=lambda record: (-record["priority"], -record["weight"], record["order"]),
-    )
-    return [record["metric"] for record in records]
-
-
 def _status_from_row(row: pd.Series) -> str:
     score = row.get("Балл эффективности %")
     available_weight = row.get("Доступность индекса ТМ %")
@@ -710,21 +838,22 @@ def _status_from_row(row: pd.Series) -> str:
         return "Недостаточно данных"
 
     score_value = float(score)
-    hard, soft = _tm_metric_signals(row)
-    if score_value >= TM_STABLE_MIN_SCORE and not hard and not soft:
-        return "Стабильно"
-    if score_value < TM_CONTROL_MIN_SCORE:
+    display_score = round(score_value * 100) if score_value <= 1 else round(score_value)
+    hard, _ = _tm_metric_signals(row)
+    if not hard:
+        return "Высокая эффективность"
+    if display_score < round(TM_CONTROL_MIN_SCORE * 100):
         return "Зона риска"
-    return "Стабильно"
+    return "Зона развития"
 
 
 def _zone_from_score(score) -> str:
     if pd.isna(score):
         return "Недостаточно данных"
     if float(score) >= TM_STABLE_MIN_SCORE:
-        return "Стабильно"
+        return "Высокая эффективность"
     if float(score) >= TM_CONTROL_MIN_SCORE:
-        return "Контроль"
+        return "Зона развития"
     return "Зона риска"
 
 
@@ -733,11 +862,14 @@ def _status_reason_from_row(row: pd.Series):
     if pd.isna(status):
         status = row.get("Статус ТМ")
 
+    hard, _ = _tm_metric_signals(row)
+    reasons = list(dict.fromkeys(hard))
+    if pd.isna(row.get("Качество команды %")):
+        reasons.append("(нет проверок ОКК)")
+    if reasons:
+        return ", ".join(dict.fromkeys(reasons))
     if status == "Недостаточно данных":
         return "Недостаточно данных"
-    hard, _ = _tm_metric_signals(row)
-    if hard:
-        return ", ".join(dict.fromkeys(hard))
     if _all_tm_effectiveness_metrics_green(row):
         return "Все метрики выше целевого уровня"
 
@@ -745,8 +877,14 @@ def _status_reason_from_row(row: pd.Series):
 
 
 def _all_tm_effectiveness_metrics_green(row: pd.Series) -> bool:
+    active_kpi_components = [
+        (pd.to_numeric(row.get(value_column), errors="coerce"), green_target)
+        for value_column, _, green_target in TM_KPI_COMPONENTS.values()
+        if pd.notna(pd.to_numeric(row.get(value_column), errors="coerce"))
+    ]
+    if not active_kpi_components or any(value < target for value, target in active_kpi_components):
+        return False
     checks = [
-        ("KPI месяца территории %", lambda value: value >= TM_KPI_GREEN_MIN),
         ("Качество команды %", lambda value: value >= TM_QUALITY_GREEN_MIN),
         ("Обучение команды %", lambda value: value >= TM_LEARNING_GREEN_MIN),
         ("Фрод %", lambda value: value <= TM_FRAUD_GREEN_MAX),
@@ -760,36 +898,63 @@ def _all_tm_effectiveness_metrics_green(row: pd.Series) -> bool:
     return True
 
 
+def _refresh_tm_effectiveness(snapshot: pd.DataFrame) -> pd.DataFrame:
+    result = snapshot.copy()
+    result["KPI месяца территории %"] = _normalize_pct(result["KPI проекта %"])
+    result["Целевой порог KPI территории %"] = result.apply(_tm_kpi_target_from_row, axis=1)
+    result["Целевой порог KPI территории %"] = pd.to_numeric(
+        result["Целевой порог KPI территории %"],
+        errors="coerce",
+    )
+    result["Результат территории %"] = result.apply(_tm_operational_result_from_row, axis=1)
+    result["Результат территории %"] = pd.to_numeric(result["Результат территории %"], errors="coerce")
+    result["Доступность индекса ТМ %"] = result.apply(_tm_available_weight_from_row, axis=1)
+    result["Балл эффективности %"] = result.apply(_tm_effectiveness_score_from_row, axis=1)
+    result["Балл эффективности"] = result["Балл эффективности %"].map(
+        lambda value: round(value * 100) if pd.notna(value) else pd.NA
+    )
+    result[
+        [
+            "Вес красных флагов ТМ %",
+            "Вес желтых флагов ТМ %",
+            "Приоритетный вес проблем ТМ %",
+        ]
+    ] = result.apply(_tm_signal_weight_summary, axis=1)
+    result["Статус ТМ"] = result.apply(_status_from_row, axis=1)
+    result["Причина статуса ТМ"] = result.apply(_status_reason_from_row, axis=1)
+    return result
+
+
 def _build_score_composition() -> pd.DataFrame:
     return pd.DataFrame(
         [
             {
                 "Порядок": 1,
                 "Вес": "30%",
-                "Блок": "KPI месяца территории",
-                "Краткое описание блока": "Выполнение клиентского KPI территории",
-                "Формула": "зеленый >=95%, желтый 90-95%, красный <90%",
+                "Блок": "Клиентские KPI территории",
+                "Краткое описание блока": "PICOS, OSA и TOP16 с учетом структуры KPI торговых точек",
+                "Формула": "PICOS: зеленый >=98%, желтый 95-98%, красный <95%; OSA/TOP16: зеленый >=95%, красный <95%",
             },
             {
                 "Порядок": 2,
                 "Вес": "20%",
                 "Блок": "Качество команды",
                 "Краткое описание блока": "Среднее качество работы команд территории",
-                "Формула": "зеленый >=80%, желтый 70-80%, красный <70%",
+                "Формула": "зеленый >=60%, желтый 40-60%, красный <40%",
             },
             {
                 "Порядок": 3,
                 "Вес": "15%",
                 "Блок": "Обучение команды",
                 "Краткое описание блока": "Средний процент прохождения обязательного обучения СВ и МЕ",
-                "Формула": "зеленый >=95%, желтый 90-95%, красный <90%",
+                "Формула": "зеленый >=90%, желтый 80-90%, красный <80%",
             },
             {
                 "Порядок": 4,
                 "Вес": "15%",
                 "Блок": "Фрод",
                 "Краткое описание блока": "Доля фрод-визитов на территории",
-                "Формула": "зеленый <=10%, желтый 10-18%, красный >18%",
+                "Формула": "зеленый <=15%, желтый 15-20%, красный >20%",
             },
             {
                 "Порядок": 5,
@@ -810,7 +975,7 @@ def _build_score_composition() -> pd.DataFrame:
                 "Вес": "-",
                 "Блок": "Статус",
                 "Краткое описание блока": "Уровень управленческого внимания",
-                "Формула": "Стабильно: балл >=80% при достаточных данных; Зона риска: балл <80%; Недостаточно данных: не хватает KPI/качества или доступно меньше 60% веса; причины показывают только красные флаги",
+                "Формула": "Высокая эффективность: нет красных флагов; Зона развития: есть красный флаг, но балл >=80%; Зона риска: есть красный флаг и балл <80%; Недостаточно данных: нет KPI или доступно меньше 60% веса; отсутствие ОКК дает 0 баллов, но не блокирует расчет",
             },
         ]
     )
@@ -839,8 +1004,30 @@ def build_page7_tm_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         ignore_index=True,
     ).dropna(subset=["MonthStart", "YearMonth"]).drop_duplicates()
     month_calendar = month_calendar[pd.to_datetime(month_calendar["MonthStart"], errors="coerce").dt.year >= REPORT_START_YEAR].copy()
-    sv_tm_map = _build_sv_tm_map(teams, tm_directory, month_calendar)
-    me_tm_map = _build_me_tm_map(teams, tm_directory, month_calendar)
+    sv_tm_map = _build_source_entity_tm_map(page5_sv, "ID супервайзера", tm_directory)
+    me_tm_map = _build_source_entity_tm_map(kpi, "ID мерчендайзера", tm_directory)
+    last_kpi_month = pd.to_numeric(kpi["YearMonth"], errors="coerce").max()
+    future_months = month_calendar[
+        pd.to_numeric(month_calendar["YearMonth"], errors="coerce").gt(last_kpi_month)
+    ][["MonthStart", "YearMonth"]].drop_duplicates()
+    if not future_months.empty:
+        current_sv_map = _build_sv_tm_map(teams, tm_directory, future_months)
+        observed_sv = page5_sv[["MonthStart", "YearMonth", "ID супервайзера"]].drop_duplicates()
+        current_sv_map = current_sv_map.merge(
+            observed_sv,
+            on=["MonthStart", "YearMonth", "ID супервайзера"],
+            how="inner",
+        )
+        sv_tm_map = _append_missing_entity_mapping(
+            sv_tm_map,
+            current_sv_map,
+            "ID супервайзера",
+        )
+        me_tm_map = _append_missing_entity_mapping(
+            me_tm_map,
+            _build_me_tm_map(teams, tm_directory, future_months),
+            "ID мерчендайзера",
+        )
     team_member_tm_map = pd.concat(
         [
             me_tm_map.rename(columns={"ID мерчендайзера": "ID сотрудника"}).assign(**{"Роль в команде": "МЕ"}),
@@ -858,9 +1045,7 @@ def build_page7_tm_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     )
     unassigned_hr_flow = _build_unassigned_hr_flow_by_month(hr_registry)
     tm_profile = tm_directory.set_index("ID территориального менеджера").to_dict("index")
-    staffing_path = out_dir / "org_staffing_tm_monthly_snapshot.parquet"
-    if not staffing_path.exists():
-        staffing_path = out_dir / "org_staffing_report_snapshot.parquet"
+    staffing_path = out_dir / "org_staffing_monthly_snapshot.parquet"
     if staffing_path.exists():
         staffing = pd.read_parquet(staffing_path)
         tm_staffing = staffing[
@@ -901,6 +1086,19 @@ def build_page7_tm_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         how="left",
         suffixes=("", "_tm"),
     )
+    mapped_tm_id_column = "ID территориального менеджера_tm"
+    mapped_tm_name_column = "Территориальный менеджер_tm"
+    if mapped_tm_id_column in sv_metrics.columns:
+        original_tm_id = sv_metrics["ID территориального менеджера"]
+        source_tm_id = original_tm_id.replace(NO_TM_ID, pd.NA)
+        use_mapped_tm = source_tm_id.isna() & sv_metrics[mapped_tm_id_column].notna()
+        sv_metrics["ID территориального менеджера"] = source_tm_id.combine_first(
+            sv_metrics[mapped_tm_id_column]
+        ).combine_first(original_tm_id)
+        if mapped_tm_name_column in sv_metrics.columns:
+            sv_metrics.loc[use_mapped_tm, "Территориальный менеджер"] = sv_metrics.loc[
+                use_mapped_tm, mapped_tm_name_column
+            ]
     sv_metrics = sv_metrics.merge(
         sv_team_size,
         on=["MonthStart", "YearMonth", "ID супервайзера"],
@@ -933,9 +1131,12 @@ def build_page7_tm_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         how="left",
     )
     if "ID территориального менеджера_x" in quality_sv.columns:
-        quality_sv["ID территориального менеджера"] = quality_sv["ID территориального менеджера_x"].combine_first(
+        original_quality_tm_id = quality_sv["ID территориального менеджера_x"]
+        quality_sv["ID территориального менеджера"] = original_quality_tm_id.replace(
+            NO_TM_ID, pd.NA
+        ).combine_first(
             quality_sv.get("ID территориального менеджера_y")
-        )
+        ).combine_first(original_quality_tm_id)
         quality_sv = quality_sv.drop(columns=["ID территориального менеджера_x", "ID территориального менеджера_y"], errors="ignore")
     for col in ["OSA %", "PICOS %", "ОКК %", "Фрод %"]:
         if col in quality_sv.columns:
@@ -1119,12 +1320,8 @@ def build_page7_tm_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         potential_count = int(sv_part["Резерв"].eq("потенциал").sum()) if "Резерв" in sv_part.columns else 0
         reserve_count = candidate_count + potential_count
         reserve_share = reserve_count / sv_count if sv_count else pd.NA
-        active_me = _sum_numeric(staff_part, "Активных МЕ", default=0)
-        if pd.isna(active_me) or active_me <= 0:
-            active_me = me_count
-        active_sv = _sum_numeric(staff_part, "Активных СВ", default=0)
-        if pd.isna(active_sv) or active_sv <= 0:
-            active_sv = sv_count
+        active_me = _sum_numeric(staff_part, "Активных МЕ", default=pd.NA)
+        active_sv = _sum_numeric(staff_part, "Активных СВ", default=pd.NA)
 
         hired_assigned = _sum_numeric(staff_part, "Нанято", default=0)
         fired_assigned = _sum_numeric(staff_part, "Уволено", default=0)
@@ -1258,7 +1455,6 @@ def build_page7_tm_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                 "Чистый отток от плановой команды %": net_outflow_share,
                 "Кадровая устойчивость %": staffing_score,
                 "Статус кадровой устойчивости": _zone_from_score(staffing_score),
-                "KPI территории %": kpi_pct,
                 "KPI месяца территории %": kpi_pct,
                 "ОКК %": okk_pct,
                 "OSA %": osa_pct,
@@ -1268,9 +1464,6 @@ def build_page7_tm_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                 "Обучение %": learning_pct,
                 "Обучение команды %": learning_pct,
                 "Антифрод %": antifraud_pct,
-                "Операционная устойчивость %": operational_score,
-                "Доступность операционной устойчивости %": operational_available_weight,
-                "Статус операционной устойчивости": _zone_from_score(operational_score),
                 "Обучение ТМ %": tm_learning_pct,
                 "Назначено обязательных курсов ТМ": tm_courses_assigned,
                 "Пройдено обязательных курсов ТМ": tm_courses_done,
@@ -1288,23 +1481,16 @@ def build_page7_tm_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                 "Потенциал СВ": potential_count,
                 "Резерв СВ": reserve_count,
                 "Резерв СВ %": reserve_share,
-                "Эффективность территории %": operational_score,
-                "Личная готовность ТМ %": personal_score,
                 "Доступность индекса ТМ %": score_available_weight,
-                "Индекс эффективности ТМ %": score,
                 "Вес красных флагов ТМ %": signal_weights["Вес красных флагов ТМ %"],
                 "Вес желтых флагов ТМ %": signal_weights["Вес желтых флагов ТМ %"],
                 "Приоритетный вес проблем ТМ %": signal_weights["Приоритетный вес проблем ТМ %"],
                 "Балл эффективности %": score,
                 "Балл эффективности": round(score * 100) if pd.notna(score) else pd.NA,
-                "Балл ТМ %": score,
-                "Балл ТМ": round(score * 100) if pd.notna(score) else pd.NA,
                 "Результат территории %": operational_score,
                 "Стабильность команды %": staffing_score,
                 "Текучесть %": turnover,
                 "Доля вакансий %": vacancy_share_planned,
-                "Причина": reason,
-                "Статус": status,
                 "Статус ТМ": status,
                 "Причина статуса ТМ": reason,
             }
@@ -1340,8 +1526,8 @@ def build_page7_tm_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         "Текучесть территории %",
         "Чистый отток от плановой команды %",
         "Кадровая устойчивость %",
-        "KPI территории %",
         "KPI месяца территории %",
+        "Целевой порог KPI территории %",
         "ОКК %",
         "OSA %",
         "PICOS %",
@@ -1350,8 +1536,6 @@ def build_page7_tm_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         "Обучение %",
         "Обучение команды %",
         "Антифрод %",
-        "Операционная устойчивость %",
-        "Доступность операционной устойчивости %",
         "Обучение ТМ %",
         "Назначено обязательных курсов ТМ",
         "Пройдено обязательных курсов ТМ",
@@ -1366,17 +1550,12 @@ def build_page7_tm_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         "Потенциал СВ",
         "Резерв СВ",
         "Резерв СВ %",
-        "Эффективность территории %",
-        "Личная готовность ТМ %",
         "Доступность индекса ТМ %",
-        "Индекс эффективности ТМ %",
         "Вес красных флагов ТМ %",
         "Вес желтых флагов ТМ %",
         "Приоритетный вес проблем ТМ %",
         "Балл эффективности %",
         "Балл эффективности",
-        "Балл ТМ %",
-        "Балл ТМ",
         "Результат территории %",
         "Стабильность команды %",
         "Текучесть %",
@@ -1399,7 +1578,6 @@ def build_page7_tm_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         "МЕ",
         "Размер команды",
         "Балл эффективности",
-        "Балл эффективности %",
         "Статус ТМ",
         "Причина статуса ТМ",
         "Вес красных флагов ТМ %",
@@ -1409,10 +1587,9 @@ def build_page7_tm_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         "Результат территории %",
         "Стабильность команды %",
         "KPI месяца территории %",
+        "Целевой порог KPI территории %",
         "Качество команды %",
         "ОКК %",
-        "OSA %",
-        "PICOS %",
         "Обучение команды %",
         "Фрод %",
         "Фрод",
@@ -1436,6 +1613,77 @@ def build_page7_tm_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         "Уволено без ТМ",
     ]
     snapshot = snapshot[[column for column in public_columns if column in snapshot.columns]].copy()
+    employee_kpi_path = out_dir / "kpi_employee_monthly_metrics.parquet"
+    page3_path = out_dir / "page3_merch_monthly_snapshot.parquet"
+    if employee_kpi_path.exists() and page3_path.exists():
+        tm_kpi_metrics = aggregate_employee_kpi_to_org(
+            pd.read_parquet(employee_kpi_path),
+            pd.read_parquet(page3_path),
+            "ID территориального менеджера",
+        )
+        snapshot = snapshot.merge(
+            tm_kpi_metrics,
+            on=["MonthStart", "YearMonth", "ID территориального менеджера"],
+            how="left",
+        )
+        snapshot = _refresh_tm_effectiveness(snapshot)
+
+    final_public_columns = [
+        "MonthStart",
+        "YearMonth",
+        "ID территориального менеджера",
+        "Код ТМ",
+        "Территориальный менеджер",
+        "Регион BI",
+        "Регионы ТМ",
+        "Группа региона",
+        "СВ",
+        "МЕ",
+        "Размер команды",
+        "Балл эффективности",
+        "Статус ТМ",
+        "Причина статуса ТМ",
+        "Вес красных флагов ТМ %",
+        "Вес желтых флагов ТМ %",
+        "Приоритетный вес проблем ТМ %",
+        "Доступность индекса ТМ %",
+        "Результат территории %",
+        "Стабильность команды %",
+        "KPI месяца территории %",
+        "Целевой порог KPI территории %",
+        "Качество команды %",
+        "Обучение команды %",
+        "Фрод %",
+        "Фрод",
+        "Открытых вакансий",
+        "Открытых вакансий МЕ",
+        "Открытых вакансий СВ",
+        "Нанято",
+        "Уволено",
+        "Баланс персонала",
+        "Текучесть %",
+        "Доля вакансий %",
+        "Резерв СВ",
+        "Резерв СВ %",
+        "Обучение ТМ %",
+        "Назначено обязательных курсов ТМ",
+        "Пройдено обязательных курсов ТМ",
+        "Средний балл теста ТМ %",
+        "Стаж, мес.",
+        "Дата приема ТМ",
+        "Нанято без ТМ",
+        "Уволено без ТМ",
+        "PICOS план %",
+        "PICOS факт %",
+        "PICOS выполнение %",
+        "OSA план %",
+        "OSA факт %",
+        "OSA выполнение %",
+        "TOP16 план %",
+        "TOP16 факт %",
+        "TOP16 выполнение %",
+    ]
+    snapshot = snapshot[[column for column in final_public_columns if column in snapshot.columns]].copy()
 
     save_parquet(snapshot, str(out_dir / "page7_tm_monthly_snapshot.parquet"))
     save_parquet(tm_directory, str(out_dir / "dTM.parquet"))

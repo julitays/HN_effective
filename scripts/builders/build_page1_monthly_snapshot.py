@@ -7,6 +7,7 @@ import pandas as pd
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+from scripts.kpi_metric_utils import KPI_PUBLIC_COLUMNS
 from scripts.utils import load_region_map, load_settings, save_parquet
 
 
@@ -82,27 +83,23 @@ def _build_kpi_monthly(kpi: pd.DataFrame, kpi_tt_direct: pd.DataFrame | None = N
     if kpi_tt_direct is not None and not kpi_tt_direct.empty:
         work = _clean_region_values(kpi_tt_direct)
         work = work[work["Регион BI"].notna()].copy()
+        value_columns = [column for column in KPI_PUBLIC_COLUMNS if column in work.columns]
         result = (
             work.groupby(["MonthStart", "YearMonth", "Регион BI"], dropna=False)
-            .agg(**{"KPI проекта %": ("KPI 1", "mean")})
+            .agg(
+                **{
+                    **{column: (column, "mean") for column in value_columns},
+                    "ТТ с валидным KPI": ("KPI проекта %", "count"),
+                }
+            )
             .reset_index()
         )
+        result["ТТ с валидным KPI"] = result["ТТ с валидным KPI"].astype("Int64")
         return result
 
-    work = _clean_region_values(kpi)
-    if "Вакансия" in work.columns:
-        work = work[work["Вакансия"] != True].copy()
-    work = work[work["Регион BI"].notna()].copy()
-    result = (
-        work.groupby(["MonthStart", "YearMonth", "Регион BI"], dropna=False)
-        .agg(
-            **{
-                "KPI проекта %": ("KPI 1", "mean"),
-            }
-        )
-        .reset_index()
+    return pd.DataFrame(
+        columns=["MonthStart", "YearMonth", "Регион BI", *KPI_PUBLIC_COLUMNS]
     )
-    return result
 
 
 def _build_okk_monthly(okk: pd.DataFrame) -> pd.DataFrame:
@@ -167,6 +164,7 @@ def _attach_last_quarter_metric(
     monthly_base: pd.DataFrame,
     quarterly_df: pd.DataFrame,
     value_col: str,
+    period: str = "quarter",
 ) -> pd.DataFrame:
     if quarterly_df.empty:
         monthly_base[value_col] = np.nan
@@ -186,7 +184,13 @@ def _attach_last_quarter_metric(
                 right_on="QuarterStart",
                 direction="backward",
             )
-            base_sorted[value_col] = merged[value_col].values
+            month_start = pd.to_datetime(base_sorted["MonthStart"], errors="coerce")
+            matched_quarter = pd.to_datetime(merged["QuarterStart"], errors="coerce")
+            if period == "year":
+                valid_period = matched_quarter.dt.year.eq(month_start.dt.year)
+            else:
+                valid_period = matched_quarter.dt.to_period("Q").eq(month_start.dt.to_period("Q"))
+            base_sorted[value_col] = merged[value_col].where(valid_period, np.nan).values
         pieces.append(base_sorted)
 
     return pd.concat(pieces, ignore_index=True)
@@ -228,6 +232,9 @@ def _build_staffing_page1(out_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
         "Уволено",
         "Чистый отток",
         "Баланс персонала",
+        "Активных МЕ",
+        "Активных СВ",
+        "Активных ТМ",
     ]
     monthly = region_staffing[[c for c in monthly_cols if c in region_staffing.columns]].copy()
     for column in [
@@ -239,44 +246,25 @@ def _build_staffing_page1(out_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
         "Уволено",
         "Чистый отток",
         "Баланс персонала",
-    ]:
-        if column in monthly.columns:
-            monthly[column] = pd.to_numeric(monthly[column], errors="coerce").fillna(0)
-
-    latest_staffing = pd.DataFrame(columns=["Регион BI"])
-    if not region_staffing.empty:
-        latest_month = region_staffing["YearMonth"].max()
-        latest_staffing = region_staffing[region_staffing["YearMonth"].eq(latest_month)].copy()
-        latest_staffing = latest_staffing[
-            [
-                c
-                for c in [
-                    "Регион BI",
-                    "Активных МЕ",
-                    "Активных СВ",
-                    "Активных ТМ",
-                    "YearMonth",
-                    "MonthStart",
-                ]
-                if c in latest_staffing.columns
-            ]
-        ].rename(
-            columns={
-                "YearMonth": "YearMonth кадрового среза",
-                "MonthStart": "MonthStart кадрового среза",
-            }
-        )
-
-    current = latest_staffing
-    for column in [
         "Активных МЕ",
         "Активных СВ",
         "Активных ТМ",
     ]:
-        if column in current.columns:
-            current[column] = pd.to_numeric(current[column], errors="coerce").fillna(0)
+        if column in monthly.columns:
+            monthly[column] = pd.to_numeric(monthly[column], errors="coerce").fillna(0)
 
-    return monthly, current
+    return monthly, pd.DataFrame(columns=["Регион BI"])
+
+
+def _latest_operational_yearmonth(*frames: pd.DataFrame) -> int | None:
+    values = []
+    for frame in frames:
+        if frame is None or frame.empty or "YearMonth" not in frame.columns:
+            continue
+        year_month = pd.to_numeric(frame["YearMonth"], errors="coerce").dropna()
+        if not year_month.empty:
+            values.append(int(year_month.max()))
+    return max(values) if values else None
 
 
 def _clip_pct(value):
@@ -476,12 +464,6 @@ def _priority_text(row: pd.Series) -> str | None:
 
     reason_scores = [
         (
-            max(0.0, REGION_STABLE_MIN - row.get("Индекс региона %", np.nan)) * 100
-            if pd.notna(row.get("Индекс региона %"))
-            else 0.0,
-            "снижен индекс региона",
-        ),
-        (
             max(0.0, row.get("Риск ухода структуры eNPS %", np.nan) - SOFT_RISK_MAX) * 160
             if pd.notna(row.get("Риск ухода структуры eNPS %"))
             else 0.0,
@@ -538,6 +520,24 @@ def _priority_text(row: pd.Series) -> str | None:
     ]
     messages = [message for score, message in sorted(reason_scores, reverse=True) if score > 0]
     if not messages:
+        transparent_metrics = [
+            (row.get("Качество визитов %"), "ОКК"),
+            (row.get("Обязательное обучение %"), "обучение"),
+            (row.get("KPI проекта %"), "KPI"),
+            (
+                1 - row.get("Фрод %") if pd.notna(row.get("Фрод %")) else np.nan,
+                "визиты без фрода",
+            ),
+            (row.get("Кадровая устойчивость %"), "стабильность команды"),
+        ]
+        available = sorted(
+            [(float(value), label) for value, label in transparent_metrics if pd.notna(value)]
+        )
+        messages = [
+            f"{label} {value:.1%}".replace(".", ",")
+            for value, label in available[:2]
+        ]
+    if not messages:
         return None
 
     return f"{region}: {', '.join(messages[:2])}."
@@ -571,37 +571,24 @@ def build_page1_monthly_snapshot() -> pd.DataFrame:
     enps_quarterly = _build_enps_quarterly(enps)
     oed_quarterly = _build_oed_quarterly(oed)
     staffing_monthly, staffing_current = _build_staffing_page1(out_dir)
-    staffing_signal_cols = [
-        "Открытых вакансий",
-        "Открытых вакансий МЕ",
-        "Открытых вакансий СВ",
-        "Приостановленных вакансий",
-        "Нанято",
-        "Уволено",
-        "Чистый отток",
-        "Баланс персонала",
-    ]
-    staffing_base = staffing_monthly.copy()
-    available_signal_cols = [c for c in staffing_signal_cols if c in staffing_base.columns]
-    if available_signal_cols:
-        staffing_base = staffing_base[
-            staffing_base[available_signal_cols]
-            .apply(pd.to_numeric, errors="coerce")
-            .fillna(0)
-            .abs()
-            .sum(axis=1)
-            .gt(0)
-        ].copy()
-
     base_keys = pd.concat(
         [
             kpi_monthly[["MonthStart", "YearMonth", "Регион BI"]],
             okk_monthly[["MonthStart", "YearMonth", "Регион BI"]],
-            staffing_base[["MonthStart", "YearMonth", "Регион BI"]],
+            staffing_monthly[["MonthStart", "YearMonth", "Регион BI"]],
         ],
         ignore_index=True,
     ).dropna(subset=["MonthStart", "YearMonth", "Регион BI"]).drop_duplicates()
     base_keys = base_keys[pd.to_numeric(base_keys["YearMonth"], errors="coerce").ge(REPORT_START_YEARMONTH)].copy()
+    latest_operational_yearmonth = _latest_operational_yearmonth(
+        kpi_monthly,
+        okk_monthly,
+        staffing_monthly,
+    )
+    if latest_operational_yearmonth is not None:
+        base_keys = base_keys[
+            pd.to_numeric(base_keys["YearMonth"], errors="coerce").le(latest_operational_yearmonth)
+        ].copy()
 
     snapshot = base_keys.merge(
         kpi_monthly,
@@ -617,8 +604,12 @@ def build_page1_monthly_snapshot() -> pd.DataFrame:
         how="left",
     )
 
-    snapshot = _attach_last_quarter_metric(snapshot, enps_quarterly, "Риск ухода структуры eNPS %")
-    snapshot = _attach_last_quarter_metric(snapshot, oed_quarterly, "Оценка команды %")
+    snapshot = _attach_last_quarter_metric(
+        snapshot, enps_quarterly, "Риск ухода структуры eNPS %", period="year"
+    )
+    snapshot = _attach_last_quarter_metric(
+        snapshot, oed_quarterly, "Оценка команды %", period="quarter"
+    )
     snapshot = snapshot.merge(
         staffing_monthly,
         on=["MonthStart", "YearMonth", "Регион BI"],
@@ -640,17 +631,23 @@ def build_page1_monthly_snapshot() -> pd.DataFrame:
         snapshot["Кадровый приток"] = (snapshot["Нанято"] - snapshot["Уволено"]).clip(lower=0)
         snapshot["Баланс персонала"] = snapshot["Нанято"] - snapshot["Уволено"]
     if {"Уволено", "Активных МЕ"}.issubset(snapshot.columns):
-        snapshot["Текучесть %"] = snapshot["Уволено"] / snapshot["Активных МЕ"].replace(0, np.nan)
+        staffing_exposure_base = (snapshot["Активных МЕ"] + snapshot["Уволено"]).replace(0, np.nan)
+        snapshot["Текучесть %"] = snapshot["Уволено"] / staffing_exposure_base
     if {"Открытых вакансий МЕ", "Активных МЕ"}.issubset(snapshot.columns):
+        planned_team_base = (snapshot["Активных МЕ"] + snapshot["Открытых вакансий МЕ"]).replace(0, np.nan)
         snapshot["Доля вакансий к активным МЕ %"] = (
-            snapshot["Открытых вакансий МЕ"] / snapshot["Активных МЕ"].replace(0, np.nan)
+            snapshot["Открытых вакансий МЕ"] / planned_team_base
         )
-    if {"Доля вакансий к активным МЕ %", "Текучесть %", "Кадровый отток", "Активных МЕ"}.issubset(snapshot.columns):
-        net_outflow_share = snapshot["Кадровый отток"] / snapshot["Активных МЕ"].replace(0, np.nan)
+    if {"Кадровый отток", "Активных МЕ", "Уволено"}.issubset(snapshot.columns):
+        staffing_exposure_base = (snapshot["Активных МЕ"] + snapshot["Уволено"]).replace(0, np.nan)
+        snapshot["Доля кадрового оттока %"] = (
+            snapshot["Кадровый отток"] / staffing_exposure_base
+        )
+    if {"Доля вакансий к активным МЕ %", "Текучесть %", "Доля кадрового оттока %"}.issubset(snapshot.columns):
         staffing_penalty = (
-            snapshot["Доля вакансий к активным МЕ %"].fillna(0) * 0.50
-            + snapshot["Текучесть %"].fillna(0) * 0.30
-            + net_outflow_share.fillna(0) * 0.20
+            snapshot["Доля вакансий к активным МЕ %"] * 0.50
+            + snapshot["Текучесть %"] * 0.30
+            + snapshot["Доля кадрового оттока %"] * 0.20
         )
         snapshot["Кадровая устойчивость %"] = (1 - staffing_penalty).clip(lower=0, upper=1)
     if {"Риск ухода структуры eNPS %", "Текучесть %", "Доля вакансий к активным МЕ %"}.issubset(snapshot.columns):
@@ -673,6 +670,8 @@ def build_page1_monthly_snapshot() -> pd.DataFrame:
 
     numeric_columns = [
         "KPI проекта %",
+        "ТТ с валидным KPI",
+        *[column for column in KPI_PUBLIC_COLUMNS if column != "KPI проекта %"],
         "Качество визитов %",
         "Фрод %",
         "Фрод кол-во",
@@ -701,6 +700,7 @@ def build_page1_monthly_snapshot() -> pd.DataFrame:
         "Открытых вакансий СВ",
         "Приостановленных вакансий",
         "Доля вакансий к активным МЕ %",
+        "Доля кадрового оттока %",
         "Текучесть %",
         "Кадровая устойчивость %",
         "Кадровый риск %",

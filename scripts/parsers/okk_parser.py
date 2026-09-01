@@ -1,13 +1,12 @@
 import sys
 import re
 import pandas as pd
-from datetime import date
 from pathlib import Path
 
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from scripts.utils import load_settings, save_parquet, normalize_dim, get_active_users_scope
+from scripts.utils import get_active_users_scope, get_as_of_date, load_settings, normalize_dim, save_parquet
 from scripts.parsers.oed_parser import _build_lookups, _match_row_with_method
 
 
@@ -236,7 +235,7 @@ def detect_period(path: Path) -> tuple[str, int, int]:
     try:
         year = int(path.parent.name)
     except ValueError:
-        year = date.today().year
+        year = get_as_of_date().year
         print(f"    ОКК: !! не удалось определить год из папки '{path.parent.name}' для {path.name}, использую текущий год {year} — проверьте файл")
     stem = path.stem.lower()
     for ru, num in MONTHS_RU.items():
@@ -257,33 +256,37 @@ def _clean_col_header(col) -> str:
     return " ".join(s.lower().split())
 
 
-def _find_detail_sheet(xl: pd.ExcelFile) -> str:
-    """Ищем лист с деталями по маркерам в имени и в заголовке."""
+def _find_detail_sheet(xl: pd.ExcelFile) -> tuple[str, int]:
+    """Ищем лист с деталями и строку заголовка в первых четырёх строках."""
     MARKERS  = ["анкеты", "w0", "w1", "детал", "лист1", "база", "данные", "detail"]
     REQUIRED = ["sap", "bu", "sv", "дата", "фио", "фальс"]
 
-    for name in xl.sheet_names:
-        low = name.lower().strip()
-        if any(m in low for m in MARKERS):
-            try:
-                df_test = xl.parse(name, nrows=3, header=0)
-                hdr = " ".join(_clean_col_header(c) for c in df_test.columns)
-                if sum(r in hdr for r in REQUIRED) >= 2:
-                    return name
-            except Exception:
-                pass
+    def find_in_sheets(sheet_names: list[str]) -> tuple[str, int] | None:
+        for name in sheet_names:
+            for header_row in range(4):
+                try:
+                    df_test = xl.parse(name, nrows=3, header=header_row)
+                    hdr = " ".join(_clean_col_header(c) for c in df_test.columns)
+                    if sum(r in hdr for r in REQUIRED) >= 2:
+                        return name, header_row
+                except Exception:
+                    pass
+        return None
 
-    # Fallback: перебираем все листы
-    for name in xl.sheet_names:
-        try:
-            df_test = xl.parse(name, nrows=3, header=0)
-            hdr = " ".join(_clean_col_header(c) for c in df_test.columns)
-            if sum(r in hdr for r in REQUIRED) >= 2:
-                return name
-        except Exception:
-            pass
+    marked_sheets = [
+        name
+        for name in xl.sheet_names
+        if any(marker in name.lower().strip() for marker in MARKERS)
+    ]
+    marked_match = find_in_sheets(marked_sheets)
+    if marked_match is not None:
+        return marked_match
 
-    return xl.sheet_names[0]
+    all_sheets_match = find_in_sheets(xl.sheet_names)
+    if all_sheets_match is not None:
+        return all_sheets_match
+
+    return xl.sheet_names[0], 0
 
 
 def _clean_name(name) -> str:
@@ -342,10 +345,21 @@ def _normalize_falsification(series: pd.Series) -> pd.Series:
 
 
 def _build_unified_falsification_flag(df: pd.DataFrame) -> pd.Series:
+    """Return the source's final falsification result without inferred fallbacks.
+
+    The explicit final flag has priority. Older files without that flag use the
+    final falsification count. Comments and reason columns are descriptive and
+    must not turn a non-fraud visit into fraud.
+    """
     explicit_flag = (
         df["has_falsification"].fillna(False).astype("boolean")
         if "has_falsification" in df.columns
         else pd.Series(False, index=df.index, dtype="boolean")
+    )
+    has_explicit_source = (
+        df["_has_explicit_falsification_flag"].fillna(False).astype(bool)
+        if "_has_explicit_falsification_flag" in df.columns
+        else pd.Series(False, index=df.index)
     )
 
     count_flag = (
@@ -353,22 +367,16 @@ def _build_unified_falsification_flag(df: pd.DataFrame) -> pd.Series:
         if "falsification_count" in df.columns
         else pd.Series(False, index=df.index)
     )
-
-    notes_flag = (
-        df["falsification_notes"].fillna("").astype(str).str.strip().ne("")
-        if "falsification_notes" in df.columns
+    has_count_source = (
+        df["_has_falsification_count"].fillna(False).astype(bool)
+        if "_has_falsification_count" in df.columns
         else pd.Series(False, index=df.index)
     )
 
-    reason_cols = [
-        c for c in df.columns
-        if c.startswith("фальс_")
-    ]
-    reason_flag = pd.Series(False, index=df.index)
-    for col in reason_cols:
-        reason_flag = reason_flag | df[col].fillna(0).eq(1)
-
-    unified = explicit_flag.fillna(False) | count_flag | notes_flag | reason_flag
+    unified = pd.Series(False, index=df.index, dtype="boolean")
+    unified.loc[has_explicit_source] = explicit_flag.loc[has_explicit_source]
+    count_fallback = ~has_explicit_source & has_count_source
+    unified.loc[count_fallback] = count_flag.loc[count_fallback]
     return unified.astype("boolean")
 
 
@@ -431,9 +439,9 @@ def _load_okk_file(
         print(f"    ОШИБКА открытия {path.name}: {e}")
         return None
 
-    sheet = _find_detail_sheet(xl)
+    sheet, header_row = _find_detail_sheet(xl)
     try:
-        raw = xl.parse(sheet, dtype=str)
+        raw = xl.parse(sheet, header=header_row, dtype=str)
         # Дедупликация: одинаковые колонки получают суффикс .1, .2 и т.д.
         seen: dict[str, int] = {}
         dedup_cols = []
@@ -478,7 +486,9 @@ def _load_okk_file(
 
     # Дата аудита
     if "audit_date" in raw.columns:
-        result["audit_date"] = pd.to_datetime(raw["audit_date"], errors="coerce")
+        result["audit_date"] = pd.to_datetime(
+            raw["audit_date"], errors="coerce", dayfirst=True, format="mixed"
+        )
     else:
         result["audit_date"] = None
 
@@ -513,14 +523,19 @@ def _load_okk_file(
             result[col] = _normalize_percent(raw[col])
 
     # Фальсификация
-    if "falsification_flag" in raw.columns:
+    has_explicit_falsification_flag = "falsification_flag" in raw.columns
+    has_falsification_count = "falsification_count" in raw.columns
+    result["_has_explicit_falsification_flag"] = has_explicit_falsification_flag
+    result["_has_falsification_count"] = has_falsification_count
+
+    if has_explicit_falsification_flag:
         result["has_falsification"] = _normalize_falsification(raw["falsification_flag"])
     else:
         result["has_falsification"] = pd.array([False] * n, dtype="boolean")
 
     result["falsification_count"] = (
         pd.to_numeric(raw["falsification_count"], errors="coerce").astype("Int16")
-        if "falsification_count" in raw.columns else pd.array([0] * n, dtype="Int16")
+        if has_falsification_count else pd.array([0] * n, dtype="Int16")
     )
     result["falsification_notes"] = (
         raw["falsification_notes"].str.strip()
@@ -554,7 +569,10 @@ def _load_okk_file(
         result[f"check_{i:02d}"] = _normalize_binary(raw[col])
 
     matched_sv = sum(1 for m in sv_methods if m != "unmatched")
-    print(f"    {path.name}[{sheet}]: {n} строк | СВ {matched_sv}/{n} | {len(check_cols)} проверок")
+    print(
+        f"    {path.name}[{sheet}, заголовок {header_row + 1}]: "
+        f"{n} строк | СВ {matched_sv}/{n} | {len(check_cols)} проверок"
+    )
     return result
 
 
@@ -633,7 +651,13 @@ def parse_okk(dim: pd.DataFrame = None) -> None:
     else:
         id_lookup, name_lookup, partial_lookup = _build_lookups(dim)
 
-    all_files = sorted(okk_root.rglob("*.xlsx"))
+    all_files = sorted(
+        [
+            path
+            for path in okk_root.rglob("*")
+            if path.is_file() and path.suffix.lower() in {".xlsx", ".xlsm"}
+        ]
+    )
     if not all_files:
         print("  ОКК: файлы не найдены, пропускаем")
         return
@@ -675,11 +699,10 @@ def parse_okk(dim: pd.DataFrame = None) -> None:
         print(f"  Удалено невалидных строк (без даты/SAP): {removed}")
 
     # ── Единый флаг фальсификации ──────────────────────────────────────────────
-    # Собираем в один признак:
-    # - явный флаг
-    # - числовой счётчик
-    # - комментарий по фальсификации
-    # - любые чек-причины фальсификации
+    # Используем только итоговый признак источника:
+    # - явный финальный флаг в новых файлах;
+    # - финальный числовой счётчик в старых файлах без явного флага.
+    # Комментарии и причины являются детализацией и не меняют итоговый флаг.
     fact_okk["has_falsification"] = _build_unified_falsification_flag(fact_okk)
 
     # ── Объединяем pct_overall и pct_средний_общий (одна метрика) ─────────────
@@ -688,7 +711,10 @@ def parse_okk(dim: pd.DataFrame = None) -> None:
         fact_okk = fact_okk.drop(columns=["pct_средний_общий"])
 
     # ── Удаляем технические колонки ────────────────────────────────────────────
-    tech = ["file_source", "sv_match_method", "tm_match_method", "me_match_method"]
+    tech = [
+        "file_source", "sv_match_method", "tm_match_method", "me_match_method",
+        "_has_explicit_falsification_flag", "_has_falsification_count",
+    ]
     fact_okk = fact_okk.drop(columns=[c for c in tech if c in fact_okk.columns])
 
     # Ещё раз чистим полностью пустые (после фильтрации строк)
@@ -746,7 +772,7 @@ def parse_okk(dim: pd.DataFrame = None) -> None:
         scope = get_active_users_scope(dim)
         before = len(fact_okk)
         fact_okk = fact_okk[fact_okk["ID мерчендайзера"].astype(str).isin(scope["merch_ids"])].copy()
-        print(f"  ОКК: фильтр по активным USERS {before} → {len(fact_okk)} строк")
+        print(f"  ОКК: фильтр по активным USERS {before} -> {len(fact_okk)} строк")
 
     save_parquet(fact_okk, output)
 

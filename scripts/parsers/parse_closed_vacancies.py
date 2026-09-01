@@ -19,11 +19,13 @@ def _close_category(status) -> str:
     return "Прочее"
 
 
-def parse_closed_vacancies() -> pd.DataFrame:
+def parse_closed_vacancies(
+    dim: pd.DataFrame | None = None,
+    teams: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     settings = load_settings()
-    users_folder = Path(settings["sources"]["users"]["folder"])
     out_dir = Path(settings["paths"]["out"])
-    folder = users_folder / "closed_vacation"
+    folder = Path(settings["sources"]["closed_vacancies"]["folder"])
     output = out_dir / "fact_closed_vacancies.parquet"
 
     files = sorted([p for p in folder.glob("*.xlsx") if p.is_file()])
@@ -32,8 +34,10 @@ def parse_closed_vacancies() -> pd.DataFrame:
         return pd.DataFrame()
 
     source = files[-1]
-    dim = pd.read_parquet(settings["sources"]["users"]["output"])
-    teams = pd.read_parquet(settings["sources"]["teams"]["output"])
+    if dim is None or dim.empty:
+        dim = pd.read_parquet(settings["sources"]["users"]["output"])
+    if teams is None or teams.empty:
+        teams = pd.read_parquet(settings["sources"]["teams"]["output"])
     reference = build_staffing_reference(dim, teams)
 
     raw = pd.read_excel(source, header=2)

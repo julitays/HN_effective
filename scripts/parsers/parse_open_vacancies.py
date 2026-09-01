@@ -10,19 +10,23 @@ from scripts.staffing_utils import build_staffing_reference, match_leader_name, 
 from scripts.utils import load_settings, save_parquet
 
 
-def parse_open_vacancies() -> pd.DataFrame:
+def parse_open_vacancies(
+    dim: pd.DataFrame | None = None,
+    teams: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     settings = load_settings()
-    users_folder = Path(settings["sources"]["users"]["folder"])
     out_dir = Path(settings["paths"]["out"])
-    source = users_folder / "open_vacation" / "ВАКАНСИИ И ЭТАПЫ ПОДБОРА.xlsx"
+    source = Path(settings["sources"]["open_vacancies"]["file"])
     output = out_dir / "fact_open_vacancies.parquet"
 
     if not source.exists():
         print("  OPEN VACANCIES: файл не найден, пропускаем")
         return pd.DataFrame()
 
-    dim = pd.read_parquet(settings["sources"]["users"]["output"])
-    teams = pd.read_parquet(settings["sources"]["teams"]["output"])
+    if dim is None or dim.empty:
+        dim = pd.read_parquet(settings["sources"]["users"]["output"])
+    if teams is None or teams.empty:
+        teams = pd.read_parquet(settings["sources"]["teams"]["output"])
     reference = build_staffing_reference(dim, teams)
 
     raw = pd.read_excel(source, header=2)

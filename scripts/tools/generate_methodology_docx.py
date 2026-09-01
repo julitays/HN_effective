@@ -1,379 +1,504 @@
-import html
+from __future__ import annotations
+
+import json
 import sys
-import zipfile
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 import pandas as pd
 
 if __package__ is None or __package__ == "":
-    sys.path.append(str(Path(__file__).resolve().parents[1]))
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
 
+from scripts.builders import build_page1_monthly_snapshot as page1
+from scripts.builders import build_page3_data as page3
+from scripts.builders import build_page4_tt_data as page4
+from scripts.builders import build_page5_sv_oed_data as page5
+from scripts.builders import build_page7_tm_data as page7
+from scripts.builders import build_page8_learning_competencies_data as page8
+from scripts.builders import build_page9_climate_data as page9
+from scripts.tools.docx_utils import (
+    bullet as _bullet,
+    paragraph as _paragraph,
+    section as _section,
+    subsection as _subsection,
+    table as _docx_table,
+    write_docx as _docx_write,
+)
 from scripts.utils import load_settings
 
 
 OUTPUT_DOCX = Path("docs") / "HN_BI_методология_расчетов.docx"
+_table = partial(_docx_table, cell_width=2200)
+_write_docx = partial(
+    _docx_write,
+    title="HN BI: методология, источники и BPMN-спецификация",
+)
 
 
-def _xml_escape(value: str) -> str:
-    return html.escape(str(value), quote=False)
+def _pct(value: float) -> str:
+    return f"{value * 100:g}%"
 
 
-def _paragraph(text: str = "", style: str | None = None) -> str:
-    style_xml = f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>' if style else ""
-    return f"<w:p>{style_xml}<w:r><w:t>{_xml_escape(text)}</w:t></w:r></w:p>"
-
-
-def _bullet(text: str) -> str:
-    return _paragraph(f"• {text}")
-
-
-def _table(rows: list[list[str]]) -> str:
-    table_rows = []
-    for row in rows:
-        cells = []
-        for cell in row:
-            cells.append(
-                "<w:tc><w:tcPr><w:tcW w:w=\"2400\" w:type=\"dxa\"/></w:tcPr>"
-                f"{_paragraph(cell)}</w:tc>"
-            )
-        table_rows.append(f"<w:tr>{''.join(cells)}</w:tr>")
-    return (
-        "<w:tbl>"
-        "<w:tblPr><w:tblBorders>"
-        "<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D9E2EC\"/>"
-        "<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D9E2EC\"/>"
-        "<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D9E2EC\"/>"
-        "<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D9E2EC\"/>"
-        "<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D9E2EC\"/>"
-        "<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D9E2EC\"/>"
-        "</w:tblBorders></w:tblPr>"
-        f"{''.join(table_rows)}</w:tbl>"
-    )
-
-
-def _section(parts: list[str], title: str) -> None:
-    parts.append(_paragraph(title, "Heading1"))
-
-
-def _subsection(parts: list[str], title: str) -> None:
-    parts.append(_paragraph(title, "Heading2"))
-
-
-def _safe_status_counts(path: Path, column: str) -> str:
+def _columns_text(path: Path) -> tuple[int | str, str]:
     if not path.exists():
-        return "файл не найден"
+        return "нет файла", "нет файла"
     frame = pd.read_parquet(path)
-    if column not in frame.columns:
-        return "колонка не найдена"
-    return "; ".join(f"{key}: {value}" for key, value in frame[column].value_counts(dropna=False).items())
+    return len(frame), "; ".join(map(str, frame.columns))
 
 
-def _write_docx(parts: list[str], output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    document_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas" '
-        'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" '
-        'xmlns:o="urn:schemas-microsoft-com:office:office" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
-        'xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math" '
-        'xmlns:v="urn:schemas-microsoft-com:vml" '
-        'xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing" '
-        'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
-        'xmlns:w10="urn:schemas-microsoft-com:office:word" '
-        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
-        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" '
-        'xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup" '
-        'xmlns:wpi="http://schemas.microsoft.com/office/word/2010/wordprocessingInk" '
-        'xmlns:wne="http://schemas.microsoft.com/office/word/2006/wordml" '
-        'xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" '
-        'mc:Ignorable="w14 wp14">'
-        "<w:body>"
-        f"{''.join(parts)}"
-        '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="850" w:bottom="1134" w:left="850" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr>'
-        "</w:body></w:document>"
+def _manifest_summary(out_dir: Path) -> tuple[str, str, str]:
+    path = out_dir / "etl_run_manifest.json"
+    if not path.exists():
+        return "нет манифеста", "не определена", "не определена"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return (
+        str(data.get("run_id") or "не определён"),
+        str(data.get("as_of_date") or "не определена"),
+        str(data.get("created_at") or "не определена"),
     )
-    content_types = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-        '<Default Extension="xml" ContentType="application/xml"/>'
-        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
-        '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
-        '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
-        "</Types>"
-    )
-    rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
-        "</Relationships>"
-    )
-    doc_rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>'
-    )
-    now = datetime.now().isoformat(timespec="seconds")
-    core = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
-        'xmlns:dc="http://purl.org/dc/elements/1.1/" '
-        'xmlns:dcterms="http://purl.org/dc/terms/" '
-        'xmlns:dcmitype="http://purl.org/dc/dcmitype/" '
-        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
-        "<dc:title>HN BI: методология расчетов</dc:title>"
-        "<dc:creator>Codex</dc:creator>"
-        f'<dcterms:created xsi:type="dcterms:W3CDTF">{now}</dcterms:created>'
-        f'<dcterms:modified xsi:type="dcterms:W3CDTF">{now}</dcterms:modified>'
-        "</cp:coreProperties>"
-    )
-    app = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" '
-        'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
-        "<Application>Codex</Application></Properties>"
-    )
-    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as docx:
-        docx.writestr("[Content_Types].xml", content_types)
-        docx.writestr("_rels/.rels", rels)
-        docx.writestr("word/document.xml", document_xml)
-        docx.writestr("word/_rels/document.xml.rels", doc_rels)
-        docx.writestr("docProps/core.xml", core)
-        docx.writestr("docProps/app.xml", app)
+
+
+def _source_registry() -> list[list[str]]:
+    return [
+        ["Источник", "Папка / файл", "Зерно входа", "Ключевые данные", "Внутренний результат"],
+        ["USERS", "MariaDB: users + employees + org_structure_level", "сотрудник", "ID, ФИО, роль, проект, руководитель, регион, дата приёма, активность", "dim_employees; dim_teams"],
+        ["Текущая привязка ТТ к ТМ", "data/raw/users/Привязки ТМ/*.xlsx", "Ship To", "Ship To, TM Name, SV Name, Cluster BU/SG, Chain, Агентство", "однозначная текущая ТТ → ТМ"],
+        ["Клиентский KPI", "data/raw/kpi/fact kpi/*.xlsx", "ТТ за месяц", "ТТ, сеть, город, KPI 1–3: название, план, факт, % (S) SCALE", "kpi_client_tt_long; kpi_client_tt_fact"],
+        ["RTM", "data/raw/kpi/RTM/**/*.xlsx", "операция/визит", "фактическая дата, ID визита, ТТ, код сотрудника, выполнение, подтверждение", "rtm_employee_visits"],
+        ["Логины RTM", "data/raw/kpi/Логины/*.xlsx", "код RTM в месяце", "месяц, код, ФИО, логин, СВ, ТМ", "однозначная связь код RTM → ID сотрудника"],
+        ["ОКК", "data/raw/okk/YYYY/*.xlsx", "проверка визита", "дата, сотрудник, ТТ, ОКК, стандарты, фото, OSA, PICOS, фрод", "okk_fact"],
+        ["Обучение", "MariaDB: students_curses + students_curs_info + courses + curs_details", "курс сотрудника", "ID, курс, статус, прогресс, тест, даты", "learning_fact; learning_monthly"],
+        ["Каталог и карта курсов", "config/courses_catalog_ЛМ_ROI_пример.xlsx", "согласованный курс", "обязательность, метод и порог закрытия, компетенция", "фильтр курсов и карта компетенций"],
+        ["ОЭД", "data/raw/oed/<роль>/*.xlsx", "участник за квартал", "KPI, аттестация, продукт, управление, команда, рейтинг, класс", "fact_oed"],
+        ["Аттестация клиента", "data/raw/attestations/*.xlsx", "аттестация сотрудника", "ID, квартал, статус, прогресс, тест, даты", "attestations_fact"],
+        ["eNPS / климат", "data/raw/enps/**/*.xlsx", "ответ анкеты", "роль, регион, ответы, блоки, риск ухода, eNPS", "enps_fact"],
+        ["Открытые вакансии", "data/raw/users/open_vacation/ВАКАНСИИ И ЭТАПЫ ПОДБОРА.xlsx", "вакансия", "ID, дата открытия, роль, регион, руководитель, статус", "fact_open_vacancies"],
+        ["Закрытые вакансии", "data/raw/users/closed_vacation/*.xlsx", "закрытая вакансия", "ID, даты открытия/закрытия, результат, срок", "fact_closed_vacancies"],
+        ["Кадровый реестр", "data/raw/users/kardovyi_db/*.xlsx", "кадровая запись", "ID, должность, руководитель, даты приёма/увольнения, договор, состояние", "fact_hr_registry"],
+        ["Региональный маппинг", "config/regions_mapping.csv", "вариант региона", "исходное значение, Регион BI, группа региона", "единый Регион BI"],
+    ]
+
+
+def _etl_steps() -> list[list[str]]:
+    labels = [
+        ("USERS", "MariaDB корпоративного университета", "dim_employees"),
+        ("ОЭД", "ОЭД + dim_employees", "fact_oed"),
+        ("Справочник команд", "dim_employees", "dim_teams"),
+        ("Открытые вакансии", "open_vacation", "fact_open_vacancies"),
+        ("Закрытые вакансии", "closed_vacation", "fact_closed_vacancies"),
+        ("Кадровый реестр", "kardovyi_db + USERS", "fact_hr_registry"),
+        ("Кадровая витрина", "USERS, команды, вакансии, кадровый реестр", "org_staffing_monthly_snapshot"),
+        ("ОКК", "ОКК + dim_employees", "okk_fact"),
+        ("Обучение", "MariaDB + согласованный каталог + dim_employees", "learning_fact"),
+        ("Месячное обучение", "learning_fact", "learning_monthly"),
+        ("KPI и визиты", "client KPI + RTM + логины + ТТ→ТМ + USERS", "KPI-факты и аудиты"),
+        ("eNPS", "анкеты eNPS", "enps_fact"),
+        ("Аттестации", "аттестации клиента", "attestations_fact"),
+        ("Страница 1", "KPI, ОКК, обучение, eNPS, ОЭД, кадры", "page1_region_monthly_snapshot"),
+        ("Страница 2", "региональные метрики и команды СВ", "page2_actions; page2_sv"),
+        ("Страница 3", "KPI, ОКК, обучение, аттестации, команды", "page3_merch"),
+        ("Страница 4", "KPI ТТ, RTM, ОКК, оргпривязка", "page4_tt_*"),
+        ("Страница 5", "СВ, команда, KPI, ОКК, обучение, кадры, ОЭД", "page5_sv; dSupervisor"),
+        ("Страница 6", "ОКК + региональный KPI", "page6_okk_*"),
+        ("Страница 7", "ТМ, СВ, МЕ, KPI, ОКК, обучение, кадры", "page7_tm; dTM"),
+        ("Квартальный ОЭД", "ОЭД + dTM", "внутренняя квартальная витрина"),
+        ("Страница 8", "обучение, карта курсов, USERS, команды, МЕ", "page8_learning_*"),
+        ("Страница 9", "eNPS + активные регионы", "page9_climate_*"),
+        ("Размерности", "готовые витрины", "dMonth; dRegion; dSupervisor; dTM"),
+        ("Контур доступа", "активная структура", "внутренняя таблица RLS"),
+    ]
+    rows = [["№", "BPMN-задача", "Основной вход", "Основной результат"]]
+    rows.extend([[str(index), label, source, result] for index, (label, source, result) in enumerate(labels, 1)])
+    return rows
+
+
+def _published_catalog(out_dir: Path, settings: dict) -> list[list[str]]:
+    purpose = {
+        "dim_employees.parquet": ("сотрудник", "сотрудники и кадровые атрибуты"),
+        "dim_teams.parquet": ("активный МЕ/СВ", "текущая иерархия МЕ → СВ → ТМ"),
+        "dMonth.parquet": ("месяц", "календарь и сортировка"),
+        "dRegion.parquet": ("регион", "справочник Регион BI"),
+        "dSupervisor.parquet": ("СВ", "срез Регион → ТМ → СВ"),
+        "dTM.parquet": ("ТМ", "справочник ТМ"),
+        "learning_monthly.parquet": ("месяц + регион", "числитель и знаменатель обязательного обучения"),
+        "okk_fact.parquet": ("проверка ОКК", "минимальный факт качества для модели"),
+        "org_staffing_report_snapshot.parquet": ("месяц + уровень", "кадровые события и численность"),
+        "page1_region_monthly_snapshot.parquet": ("месяц + регион", "сводка и приоритет региона"),
+        "page2_actions_monthly.parquet": ("месяц + действие", "приоритетные действия"),
+        "page2_sv_monthly_snapshot.parquet": ("месяц + СВ", "драйверы команды СВ"),
+        "page3_merch_monthly_snapshot.parquet": ("месяц + МЕ", "личная эффективность МЕ"),
+        "page4_tt_formula.parquet": ("компонент", "легенда сложности ТТ"),
+        "page4_tt_monthly_snapshot.parquet": ("месяц + ТТ", "KPI и сложность ТТ"),
+        "page4_tt_status_legend.parquet": ("статус", "легенда статуса ТТ"),
+        "page5_sv_monthly_snapshot.parquet": ("месяц + СВ", "управление и личный профиль СВ"),
+        "page6_okk_insights_monthly.parquet": ("месяц + сигнал", "аномалии и действия ОКК"),
+        "page6_okk_region_monthly.parquet": ("месяц + регион", "тренд ОКК"),
+        "page7_tm_monthly_snapshot.parquet": ("месяц + ТМ", "эффективность территории"),
+        "page8_learning_course_summary.parquet": ("месяц + новичок", "адаптация новичков"),
+        "page8_learning_employee_matrix.parquet": ("месяц + МЕ", "компетенции"),
+        "page9_climate_blocks_region.parquet": ("регион + блок", "блоки климата"),
+        "page9_climate_quarterly_region.parquet": ("квартал + регион", "климат и риск ухода"),
+    }
+    rows = [["Выход Power BI", "Зерно", "Назначение", "Строк", "Опубликованные поля"]]
+    for filename in settings["reporting"]["publish_tables"]:
+        grain, description = purpose.get(filename, ("уточняется", "опубликованная таблица"))
+        row_count, columns = _columns_text(out_dir / filename)
+        rows.append([filename, grain, description, str(row_count), columns])
+    return rows
+
+
+def _add_common_rules(parts: list[str]) -> None:
+    _section(parts, "4. Единые правила и контролируемые fallback")
+    parts.extend([
+        _bullet("Проценты хранятся числами от 0 до 1; Power BI только форматирует их как проценты."),
+        _bullet("Клиентский KPI не заменяется ОКК, старым KPI, средним по региону или расчётным аналогом."),
+        _bullet("Отсутствие клиентского KPI не удаляет месяц: доступные ОКК и кадровые показатели отображаются, а KPI остаётся пустым."),
+        _bullet("PICOS, OSA и TOP16 валидны только при наличии названия KPI, положительного плана, факта и клиентского SCALE."),
+        _bullet("PICOS составляет 100% KPI ТТ. Если PICOS нет, но есть OSA и TOP16, они составляют по 50%. Неполная схема не рассчитывается."),
+        _bullet("Региональный KPI — среднее по ТТ с валидным клиентским KPI; каждая ТТ имеет одинаковый вес."),
+        _bullet("KPI сотрудника взвешивается подтверждёнными RTM-визитами."),
+        _bullet("Сотрудники и руководители подтверждаются по ID и активному USERS; неактивные лица не назначаются в текущую структуру."),
+        _bullet("ТМ ТТ определяется по точному Ship To. Конфликтующая ТТ или визит без активного ТМ исключается и попадает в аудит."),
+        _bullet("Вакансия / нет ТМ и Вакансия / нет СВ допустимы только при подтверждённом отсутствии руководителя."),
+        _bullet("ОЭД переносится только внутри квартала; eNPS — только внутри года опроса."),
+        _bullet("Недостаточно данных назначается при доступности менее 60% веса или отсутствии критической метрики."),
+        _bullet("Для компетенций используются только курсы официального маппинга; эвристики по названию запрещены."),
+        _bullet("Новое правило замены отсутствующего значения сначала согласуется и фиксируется в docs/fallback_policy.md."),
+    ])
+    parts.append(_table([
+        ["Шлюз RTM/KPI", "Да", "Нет"],
+        ["Есть дата, ID визита, выполнен и подтверждён", "продолжить", "удалить визит и записать аудит"],
+        ["Код RTM однозначно связан с сотрудником", "продолжить", "сотрудник не назначается"],
+        ["ТМ подтверждён активным USERS", "продолжить", "исключить из ТМ-аналитики"],
+        ["Клиентский KPI валиден", "рассчитать KPI", "оставить KPI пустым"],
+    ]))
+
+
+def _add_kpi_methodology(parts: list[str]) -> None:
+    _section(parts, "5. Базовая методология клиентского KPI")
+    parts.extend([
+        _bullet("План: Цель по KPI №1/№2/№3 из клиентского файла."),
+        _bullet("Факт: Факт KPI №1/№2/№3, соответствующий названию KPI."),
+        _bullet("Выполнение: % (S) SCALE. Он уже учитывает клиентские правила и может быть нулём ниже порога проекта."),
+        _bullet("Пустой факт не превращается в нулевой SCALE."),
+        _bullet("PICOS-схема: KPI проекта = PICOS выполнение."),
+        _bullet("OSA+TOP16-схема: KPI проекта = 50%×OSA выполнение + 50%×TOP16 выполнение."),
+        _bullet("KPI сотрудника = сумма(KPI ТТ×подтверждённые визиты) / сумма подтверждённых визитов."),
+        _bullet("KPI региона = среднее KPI уникальных ТТ с валидным KPI."),
+    ])
+
+
+def _add_page1(parts: list[str]) -> None:
+    _section(parts, "6. Страница 1 — эффективность регионов")
+    parts.append(_paragraph("Выход: page1_region_monthly_snapshot; строка = месяц + Регион BI."))
+    parts.append(_table([
+        ["Показатель", "Источник", "Расчёт"],
+        ["KPI проекта %", "client KPI", "среднее по ТТ с валидным KPI"],
+        ["Качество визитов %", "ОКК", "среднее итогового ОКК"],
+        ["Фрод %", "ОКК", "фрод-проверки / все проверки ОКК"],
+        ["Антифрод %", "ОКК", "1 − Фрод %; именно эта положительная метрика входит в индекс"],
+        ["Обязательное обучение %", "обучение", "пройдено / назначено обязательных курсов"],
+        ["Риск eNPS %", "eNPS", "ответы высокого риска / ответы; только год опроса"],
+        ["Оценка команды %", "ОЭД", "средняя аттестация команды; только квартал ОЭД"],
+        ["Текучесть %", "кадровый реестр + USERS", "уволено / (активные МЕ на конец месяца + уволено за месяц)"],
+        ["Кадровый отток, чел.", "кадровый реестр", "MAX(уволено − нанято; 0)"],
+        ["Доля кадрового оттока %", "кадровый реестр + USERS", "кадровый отток / (активные МЕ на конец месяца + уволено за месяц)"],
+        ["Доля вакансий %", "вакансии + USERS", "незакрытые вакансии МЕ / (активные МЕ + незакрытые вакансии МЕ)"],
+        ["Кадровая устойчивость %", "кадровый снимок", "1 − 50%×доля вакансий − 30%×текучесть − 20%×доля кадрового оттока"],
+    ]))
+    parts.append(_table([["Компонент операционной эффективности", "Вес"]] + [[metric, _pct(weight)] for metric, weight in page1.OPERATIONAL_WEIGHTS.items()]))
+    parts.extend([
+        _bullet(f"Индекс региона = {_pct(page1.REGION_OPERATIONAL_WEIGHT)}×операционная эффективность + {_pct(page1.REGION_STAFFING_WEIGHT)}×кадровая устойчивость; нормируется на доступный вес."),
+        _bullet(f"Минимальная доступность: {_pct(page1.MIN_REGION_METRIC_AVAILABILITY)}."),
+        _bullet(f"Высокий риск: индекс <{_pct(page1.REGION_CONTROL_MIN)}, либо 2+ жёстких сигнала, либо одновременно жёсткая текучесть и отток."),
+        _bullet(f"Контроль: индекс <{_pct(page1.REGION_STABLE_MIN)}, либо 1+ жёсткий, либо 2+ мягких сигнала."),
+        _bullet("Стабильно: условия риска и контроля не выполнены."),
+        _bullet("Приоритет формируется только для Контроля/Высокого риска; выводятся две максимальные причины."),
+    ])
+    parts.append(_table([
+        ["Сигнал", "Мягкий", "Жёсткий"],
+        ["KPI", f"<{_pct(page1.SOFT_KPI_MIN)}", f"<{_pct(page1.HARD_KPI_MIN)}"],
+        ["ОКК", f"<{_pct(page1.SOFT_OKK_MIN)}", f"<{_pct(page1.HARD_OKK_MIN)}"],
+        ["Обучение", f"<{_pct(page1.SOFT_LEARN_MIN)}", f"<{_pct(page1.HARD_LEARN_MIN)}"],
+        ["Фрод", f">{_pct(page1.SOFT_FRAUD_MAX)}", f">{_pct(page1.HARD_FRAUD_MAX)}"],
+        ["Риск eNPS", f">={_pct(page1.SOFT_RISK_MAX)}", f">={_pct(page1.HARD_RISK_MAX)}"],
+        ["Доля вакансий", f">={_pct(page1.SOFT_VACANCY_SHARE_MAX)}", f">={_pct(page1.HARD_VACANCY_SHARE_MAX)}"],
+        ["Текучесть", f">={_pct(page1.SOFT_TURNOVER_MAX)}", f">={_pct(page1.HARD_TURNOVER_MAX)}"],
+        ["Кадровый отток, чел.", f">={page1.SOFT_NET_OUTFLOW_MIN}", f">={page1.HARD_NET_OUTFLOW_MIN}"],
+        ["Кадровая устойчивость", f"<{_pct(page1.SOFT_STAFFING_MIN)}", f"<{_pct(page1.HARD_STAFFING_MIN)}"],
+    ]))
+
+
+def _add_page2(parts: list[str]) -> None:
+    _section(parts, "7. Страница 2 — KPI и драйверы")
+    parts.extend([
+        _bullet("Выходы: page2_actions_monthly и page2_sv_monthly_snapshot."),
+        _bullet("Для PICOS, OSA и TOP16 разрыв рассчитывается по фактическому плану и факту клиентского KPI."),
+        _bullet("Фрод: цель <=10%. Обучение: цель >=90%. Доля сложных ТТ: цель <=15%."),
+        _bullet("Первое действие СВ: если KPI <95% — Разобрать KPI; иначе максимальный разрыв среди фрода, ОКК, OSA, PICOS, TOP16 и обучения."),
+        _bullet("Статус команды: два и более нарушения = Высокий риск; одно = Контроль; ни одного = Стабильно."),
+        _bullet("Оценка влияния — приоритизационный сценарий, не доказанный причинный эффект и не финансовый прогноз."),
+    ])
+
+
+def _add_page3(parts: list[str]) -> None:
+    _section(parts, "8. Страница 3 — мерчендайзеры")
+    parts.append(_paragraph("Выход: page3_merch_monthly_snapshot; строка = месяц + МЕ."))
+    parts.append(_table([
+        ["Блок", "Вес", "Зелёный", "Жёлтый", "Красный"],
+        ["Клиентские KPI", "40%", ">=99%", "95–99%", "<95%"],
+        ["ОКК", "15%", ">=60%", "40–60%", "<40%"],
+        ["Обучение", "20%", ">=95%", "90–95%", "<90%"],
+        ["Аттестация клиента", "25%", ">=95%", "90–95%", "<90%"],
+    ]))
+    parts.extend([
+        _bullet("KPI-блок использует PICOS/OSA/TOP16 и их фактические веса."),
+        _bullet("Ниже красного порога блок даёт 0. Начиная с жёлтого: вес×MIN(факт/зелёный порог; 1)."),
+        _bullet("Если аттестации клиента нет, 25 баллов не снимаются; остальные блоки работают."),
+        _bullet("KPI критичен; без валидной клиентской KPI-схемы статус не рассчитывается."),
+        _bullet("Стаж <3 месяцев = Новичок. Любой красный блок = Зона развития."),
+        _bullet("Высокая личная готовность: балл >=90%, доступно 100% метрик и нет отклонений."),
+        _bullet("Соответствует роли: нет красных отклонений, но условия высокой готовности не выполнены."),
+        _bullet("Причина содержит только красные блоки; KPI расшифровывается до PICOS/OSA/TOP16."),
+    ])
+
+
+def _add_page4(parts: list[str]) -> None:
+    _section(parts, "9. Страница 4 — сложность торговых точек")
+    parts.append(_paragraph("Выход: page4_tt_monthly_snapshot; строка = месяц + ТТ."))
+    parts.append(_table([
+        ["Компонент", "Вес", "Правило"],
+        ["Повторяемый KPI-разрыв", _pct(page4.KPI_REPEAT_WEIGHT), "разрыв до 95% за три месяца"],
+        ["Нестабильность KPI", _pct(page4.KPI_INSTABILITY_WEIGHT), "размах PICOS либо OSA+TOP16"],
+        ["Повторяемость ОКК", _pct(page4.OKK_REPEAT_WEIGHT), "доля проверок ниже 60%; 2+ проверки"],
+        ["Разрыв с похожими ТТ", _pct(page4.PEER_GAP_WEIGHT), "медиана сети, города и KPI-схемы; 5+ аналогов"],
+        ["Смена основного МЕ", _pct(page4.ME_CHANGE_WEIGHT), "по подтверждённым RTM-визитам"],
+    ]))
+    parts.extend([
+        _bullet(f"Нужно >=60% веса, >=2 KPI-месяцев и >=3 RTM-визитов."),
+        _bullet("ТТ с фактической проверкой ОКК остаётся в месяце без KPI/RTM; KPI, визиты и сложность не подставляются."),
+        _bullet("Если ОКК нет, блок исключается без штрафа; веса нормируются."),
+        _bullet("Эталон: сложность <=25%, KPI >=95%, ОКК отсутствует или >=60%."),
+        _bullet("Сложная ТТ: сложность >=50%. Не вина МЕ: высокий разрыв повторён при 2+ разных основных МЕ."),
+        _bullet("Контроль: данных достаточно, но условия остальных статусов не выполнены."),
+        _bullet("Score ТТ = 55×KPI + 45×(1−сложность)."),
+    ])
+
+
+def _add_page5(parts: list[str]) -> None:
+    _section(parts, "10. Страница 5 — супервайзеры")
+    parts.append(_table([
+        ["Управление командой", "Вес", "Зелёный", "Жёлтый", "Красный"],
+        ["KPI", "35%", "PICOS >=98%; OSA/TOP16 >=95%", "между порогами", "активный KPI <95%"],
+        ["ОКК команды", "15%", ">=60%", "40–60%", "<40%"],
+        ["Обучение команды", "15%", ">=95%", "90–95%", "<90%"],
+        ["Фрод", "15%", "<=15%", "15–20%", ">20%"],
+        ["Стабильность команды", "15%", ">=95%", "90–95%", "<90%"],
+        ["Текучесть", "5%", "<=10%", "10–15%", ">15%"],
+    ]))
+    parts.extend([
+        _bullet("Ниже красного порога — 0. Для метрик роста: вес×MIN(факт/цель;1). Для фрода/текучести балл линейно падает до нуля."),
+        _bullet("Доступность >=60%; KPI обязателен. Нет ОКК — 0 за блок, но расчёт не останавливается."),
+        _bullet("Красный флаг или балл <80% = Зона развития; балл >=90% без жёлтых/красных = Высокая готовность; иначе Соответствует роли."),
+        _bullet("Причина содержит только красные блоки по убыванию веса."),
+        _bullet("Стабильность команды = 1−70%×доля вакансий−20%×текучесть−10%×доля чистого оттока."),
+    ])
+    _subsection(parts, "Личная эффективность СВ")
+    parts.append(_table([
+        ["Блок", "Вес", "Зелёный", "Жёлтый", "Красный"],
+        ["Аттестация клиента", "40%", ">=95%", "90–95%", "<90%"],
+        ["Аттестация ОЭД", "20%", ">=95%", "90–95%", "<90%"],
+        ["Продукт ОЭД", "20%", ">=95%", "90–95%", "<90%"],
+        ["Управление ОЭД", "20%", ">=95%", "90–95%", "<90%"],
+    ]))
+    parts.extend([
+        _bullet("Ниже 90% метрика даёт 0; итог нормируется на доступный вес."),
+        _bullet("Не участвовал в ОЭД = Новичок; нули за ОЭД не проставляются."),
+        _bullet("Высокая личная готовность: балл >=95%, все блоки зелёные, доступно 100%, класс последнего ОЭД = ТОП."),
+        _bullet("Соответствует роли: балл >=90% и нет красных блоков; иначе Зона развития."),
+        _bullet("KPI ОЭД справочный и не входит в личный балл."),
+    ])
+
+
+def _add_page6(parts: list[str]) -> None:
+    _section(parts, "11. Страница 6 — ОКК и фрод")
+    parts.extend([
+        _bullet("Региональный тренд ОКК = среднее итогового ОКК проверок."),
+        _bullet("Для блока выбирается регион с минимальным результатом месяца."),
+        _bullet("Просадка ОКК = MAX(среднее без нарушения − среднее с нарушением; 0). Это связь, не доказанная причинность."),
+        _bullet("Доля нарушения = проверки с нарушением / доступные проверки."),
+        _bullet("Фото ниже нормы = правила фотографирования ниже 75%."),
+        _bullet("Сигналы: фрод у СВ, ОКК падает раньше KPI, слабые OSA/PICOS, низкое фото при высоком фроде."),
+    ])
+
+
+def _add_page7(parts: list[str]) -> None:
+    _section(parts, "12. Страница 7 — территориальные менеджеры")
+    parts.append(_table([
+        ["Блок", "Вес", "Зелёный", "Жёлтый", "Красный"],
+        ["KPI территории", "30%", "PICOS >=98%; OSA/TOP16 >=95%", "между порогами", "активный KPI <95%"],
+        ["Качество команды", "20%", ">=60%", "40–60%", "<40%"],
+        ["Обучение команды", "15%", ">=90%", "80–90%", "<80%"],
+        ["Фрод", "15%", "<=15%", "15–20%", ">20%"],
+        ["Стабильность команды", "15%", ">=95%", "90–95%", "<90%"],
+        ["Текучесть", "5%", "<=10%", "10–15%", ">15%"],
+    ]))
+    parts.extend([
+        _bullet("Целевой KPI динамический: цели активных компонентов умножаются на их фактические веса."),
+        _bullet("Обучение команды включает активных МЕ и СВ контура ТМ."),
+        _bullet("Стабильность = 1−70%×вакансии−20%×текучесть−10%×чистый отток."),
+        _bullet("Доступность >=60%; KPI и целевой порог обязательны."),
+        _bullet("Нет красных = Высокая эффективность; красный и балл <80% = Зона риска; иначе Зона развития."),
+        _bullet("Причина содержит красные блоки; при пустом ОКК добавляется (нет проверок ОКК)."),
+        _bullet("Личные обучение ТМ, тест и стаж справочные."),
+    ])
+
+
+def _add_page8(parts: list[str]) -> None:
+    _section(parts, "13. Страница 8 — обучение и адаптация")
+    parts.extend([
+        _bullet("Матрица: активные H&N МЕ и только курсы официального маппинга."),
+        _bullet("Курс закрыт, если источник подтверждает прохождение и выполнен способ/порог каталога."),
+        _bullet("Компетенция = 1 после успешно закрытого связанного курса; иначе 0; до запуска — пусто."),
+        _bullet(f"% закрытых компетенций = закрыто/доступно; блоки: {', '.join(page8.COMPETENCY_COLUMNS)}."),
+        _bullet("Адаптация: новичок <3 месяцев, закрывший обязательный курс в предыдущем месяце."),
+        _bullet("ОКК 1-го месяца = месяц обучения; ОКК 2-го = выбранный следующий месяц."),
+        _bullet("Опытные = сотрудники региона со стажем >3 месяцев."),
+        _bullet("Разрыв с опытными = ОКК 2-го месяца − ОКК опытных."),
+        _bullet("Операционная готовность = среднее признаков: ОКК2 >=60%; ОКК2 >= ОКК1; разрыв >=−5%."),
+        _bullet("Готовность новичка = MIN(обязательное обучение; операционная готовность)."),
+        _bullet("Вышел на уровень: обучение >=95%, ОКК2 >=60%, разрыв >=−5%."),
+        _bullet("Нужна поддержка: обучение <90%, либо ОКК2 <50%, либо ОКК снизился."),
+        _bullet("Мало данных: нет обучения или ОКК1/ОКК2; иначе Есть прогресс."),
+        _bullet("Обучение до даты приёма не включается в текущий эпизод; предвыходной интервал = 0 дней."),
+    ])
+
+
+def _add_page9(parts: list[str]) -> None:
+    _section(parts, "14. Страница 9 — анонимный климат")
+    parts.extend([
+        _bullet("Удовлетворённость, вовлечённость, лояльность = среднее ответа / 10."),
+        _bullet("Риск ухода = ответы высокого риска / ответы с оценённым риском."),
+        _bullet("eNPS = (промоутеры − критики) / ответы eNPS ×100."),
+        _bullet(f"Статус только при {page9.MIN_REGION_RESPONSES}+ ответах."),
+        _bullet(f"Высокий риск: риск >={_pct(page9.HIGH_RISK_MIN_RISK)} или удовлетворённость <{_pct(page9.HIGH_RISK_MAX_SAT)}."),
+        _bullet(f"Контроль: риск >={_pct(page9.CONTROL_MIN_RISK)} или удовлетворённость <{_pct(page9.CONTROL_MAX_SAT)}; иначе Стабильно."),
+    ])
+
+
+def _add_staffing(parts: list[str]) -> None:
+    _section(parts, "15. Кадровые показатели")
+    parts.extend([
+        _bullet("Текущая численность — последний USERS; историческая — кадровые эпизоды на конец месяца."),
+        _bullet("Активен на конец месяца: принят не позже конца месяца и не уволен к этой дате."),
+        _bullet("Повторный выход, переоформление и неподтверждённое увольнение исключаются из потоков."),
+        _bullet("Открытые вакансии — незакрытый остаток на конец месяца: дата открытия не позже конца месяца, дата закрытия отсутствует или позже конца месяца."),
+        _bullet("История остатка объединяет текущий список открытых вакансий и журнал закрытых вакансий; записи без ID, даты открытия или региона не учитываются."),
+        _bullet("Баланс = нанято − уволено. Риск оттока использует MAX(уволено − нанято; 0)."),
+    ])
+
+
+def _add_bpmn_control(parts: list[str], settings: dict) -> None:
+    _section(parts, "16. BPMN: контроль и публикация")
+    parts.append(_table([
+        ["Элемент", "Условие / действие", "Результат"],
+        ["Старт", "новые утверждённые файлы в data/raw", "запуск ETL"],
+        ["Задача", "lock + отдельная staging-папка", "старый data/out остаётся рабочим"],
+        ["Шлюз ошибки", "любой шаг завершился ошибкой", "публикация запрещена"],
+        ["Расчёт", "25 шагов ETL", "факты, витрины, размерности"],
+        ["Шлюз QA", "структура, ключи, типы и свежесть корректны", "разрешить публикацию"],
+        ["QA — нет", "ошибка или месяц ниже ожидаемого", "удалить staging, сохранить старый out"],
+        ["Оптимизация", "удалить технические таблицы и поля", "минимальная модель"],
+        ["Аудит", "создать манифест с хешами", "версия данных зафиксирована"],
+        ["Публикация", "атомарно заменить data/out", "новые данные доступны"],
+        ["Конец", "Power BI обновил модель", "обновлённый дашборд"],
+    ]))
+    parts.extend([
+        _bullet("Запуск: .\\.venv\\Scripts\\python.exe scripts\\run_all_parsers.py"),
+        _bullet(f"Ожидаемый последний официальный месяц: {settings['reporting']['expected_latest_yearmonth']}."),
+        _bullet("Публикуется только reporting.publish_tables из config/settings.yml."),
+        _bullet("Манифест: data/out/etl_run_manifest.json; время шагов: reports/etl_performance_latest.csv."),
+    ])
+
+
+def _add_limitations(parts: list[str]) -> None:
+    _section(parts, "18. Ограничения интерпретации")
+    parts.extend([
+        _bullet("ОКК покрывает выборку визитов, а не все визиты; отсутствие ОКК не равно нулю."),
+        _bullet("Page6 показывает статистическую связь, а не причинность."),
+        _bullet("Оценка влияния Page2 — приоритет, а не обещание прироста KPI."),
+        _bullet("eNPS и ОЭД периодические; отсутствие участия не превращается в ноль."),
+        _bullet("USERS определяет актуальных людей; RTM/KPI сохраняют факт визита и результата месяца."),
+        _bullet("Исторический остаток вакансий зависит от полноты дат открытия и закрытия в кадровых источниках."),
+        _bullet("Новая формула, порог или fallback согласуется до изменения ETL."),
+    ])
 
 
 def build_document() -> Path:
     settings = load_settings()
     out_dir = Path(settings["paths"]["out"])
-    qa_path = out_dir / "qa_vitrines_report.xlsx"
-    qa_summary = "QA не запускался"
-    if qa_path.exists():
-        qa = pd.read_excel(qa_path, sheet_name="checks")
-        qa_summary = (
-            f"OK: {qa['Уровень'].eq('OK').sum()}, "
-            f"WARN: {qa['Уровень'].eq('WARN').sum()}, "
-            f"ERROR: {qa['Уровень'].eq('ERROR').sum()}"
-        )
-
-    parts: list[str] = []
-    parts.append(_paragraph("HN BI: методология расчетов витрин", "Title"))
-    parts.append(_paragraph(f"Дата формирования: {datetime.now():%d.%m.%Y %H:%M}"))
-    parts.append(_paragraph(f"Контрольный QA: {qa_summary}. Отчет QA: data/out/qa_vitrines_report.xlsx"))
-
-    _section(parts, "1. Общие правила данных")
-    parts.extend(
-        [
-            _bullet("Структурные привязки сотрудников, СВ, ТМ и регионов берутся из актуального USERS-периметра; исторические KPI/OKK не переопределяют текущую оргструктуру."),
-            _bullet("В отчетные витрины по сотрудникам попадают активные сотрудники проекта H&N; авторизация = Нет не исключает новичка, если сотрудник активен."),
-            _bullet("Проценты в parquet хранятся числами 0..1; в Power BI их нужно форматировать как процент."),
-            _bullet("Если метрика отсутствует, ETL не подставляет старое значение без явного правила. Для индексных витрин используется контроль доступного веса."),
-            _bullet("Если доступно меньше 60% веса ключевых метрик или отсутствует обязательная ключевая метрика, ставится статус Недостаточно данных."),
-        ]
-    )
-
-    _section(parts, "2. Страница 1: регионы")
-    parts.append(_paragraph("Витрина: data/out/page1_region_monthly_snapshot.parquet. Строка = месяц + Регион BI."))
-    parts.extend(
-        [
-            _bullet("KPI проекта %: средний KPI 1 из клиентских KPI TT-файлов, если они есть; старый KPI за прошлый месяц не подставляется."),
-            _bullet("Качество визитов %: среднее Качество визита из okk_fact."),
-            _bullet("Фрод %: доля визитов с Флаг фальсификации = True; Фрод кол-во = количество таких визитов."),
-            _bullet("Обязательное обучение %: доля пройденных обязательных назначений из learning_monthly."),
-            _bullet("Риск ухода структуры eNPS % и Оценка команды %: последний доступный квартальный показатель на дату месяца."),
-            _bullet("Кадровая устойчивость % = 1 - 50% * доля вакансий к активным МЕ - 30% * текучесть - 20% * доля кадрового оттока."),
-            _bullet("Индекс региона % = 65% операционный блок + 35% кадровая устойчивость; внутри операционного блока: KPI 30%, OKK 20%, обучение 15%, антифрод 15%, климат 10%, оценка команды 10%."),
-            _bullet("Статус: Недостаточно данных при доступности <60%; Высокий риск при индексе <80%, двух красных сигналах или кадровом collapse; Контроль при индексе <88%, одном красном или двух мягких сигналах; иначе Стабильно."),
-            _bullet("Приоритеты справа формируются только для Контроль/Высокий риск; Стабильно и Недостаточно данных в приоритеты не выводятся."),
-        ]
-    )
-
-    _section(parts, "3. Страница 2: KPI и драйверы")
-    parts.append(_paragraph("Витрины: page2_actions_monthly и page2_sv_monthly_snapshot."))
-    parts.extend(
-        [
-            _bullet("page2_actions_monthly собирает действия только там, где есть реальный разрыв до цели."),
-            _bullet("Первое действие СВ выбирается в ETL: если KPI ниже цели — Разобрать KPI; иначе берется максимальный разрыв среди фрода, ОКК, OSA, PICOS и обучения."),
-            _bullet("Статус команды: 2+ нарушенных блока = Высокий риск; 1 нарушенный блок = Контроль; без нарушений = Стабильно."),
-            _bullet("Технический ключ Page2 по СВ очищен: одна строка = месяц + ID супервайзера."),
-        ]
-    )
-
-    _section(parts, "4. Страница 3: мерчендайзеры")
-    parts.append(_paragraph("Витрина: page3_merch_monthly_snapshot. Строка = месяц + мерчендайзер."))
-    parts.append(
-        _table(
-            [
-                ["Метрика", "Вес", "Зеленая зона", "Желтая зона", "Красная зона"],
-                ["KPI проекта %", "40%", ">=95%", ">90% и <95%", "<90%"],
-                ["ОКК %", "15%", ">=60%", "40–60%", "<40%"],
-                ["Обучение %", "20%", ">=95%", "90–95%", "<90%"],
-                ["Аттестация клиента %", "25%", ">=95%", ">90% и <95%", "<90%"],
-            ]
-        )
-    )
-    parts.extend(
-        [
-            _bullet("Балл личной эффективности = сумма баллов четырех блоков. Если значение ниже красного порога, блок дает 0 баллов."),
-            _bullet("Если значение достигло желтого порога, блок дает Вес * MIN(Значение / Зеленый порог, 1)."),
-            _bullet("KPI проекта % и ОКК % — критичные метрики; если их нет, статус = Недостаточно данных."),
-            _bullet("Если Аттестация клиента % отсутствует, блок не снижает балл; это нейтральный fallback для новичков/не участвовавших."),
-            _bullet("Причина личной эффективности выводит просевшие блоки; аттестация клиента указывается с кварталом, если квартал определен."),
-        ]
-    )
-
-    _section(parts, "5. Страница 4: сложность торговых точек")
-    parts.append(_paragraph("Витрина: page4_tt_monthly_snapshot. Строка = месяц + ТТ."))
-    parts.append(
-        _table(
-            [
-                ["Компонента сложности", "Вес"],
-                ["Повторяемая просадка KPI проекта на ТТ при разных МЕ", "35%"],
-                ["Нестабильность OSA/PICOS по истории", "25%"],
-                ["Повторяемость OKK-нарушений на ТТ", "20%"],
-                ["Отклонение от похожих ТТ сети/города", "10%"],
-                ["Частая смена МЕ / нестабильность маршрута", "10%"],
-            ]
-        )
-    )
-    parts.extend(
-        [
-            _bullet("Сложность % считается только если есть минимум 2 месяца истории и минимум 3 визита по ТТ; иначе Сложность % = пусто и Статус ТТ = Недостаточно данных."),
-            _bullet("Эталон: сложность <=35%, KPI проекта >=80%, ОКК >=60%."),
-            _bullet("Сложная ТТ: сложность >=65%, если основной вклад дают KPI/OSA/PICOS/OKK-компоненты."),
-            _bullet("Не вина МЕ: сложность >=65%, если основной вклад дают похожие ТТ, сеть/город или частая смена МЕ."),
-            _bullet("Контроль: данных достаточно, но точка не попала в Эталон или Сложная ТТ."),
-        ]
-    )
-
-    _section(parts, "6. Страница 5: супервайзеры — работа с командой")
-    parts.append(_paragraph("Витрина: page5_sv_monthly_snapshot. Управленческий балл не включает клиентскую аттестацию и личную эффективность."))
-    parts.append(
-        _table(
-            [
-                ["Метрика", "Вес", "Зеленая зона", "Желтая зона", "Красная зона"],
-                ["KPI месяца %", "35%", ">=95%", "90–95%", "<90%"],
-                ["ОКК команды %", "15%", ">=60%", "40–60%", "<40%"],
-                ["Обучение команды %", "15%", ">=95%", "90–95%", "<90%"],
-                ["Фрод %", "15%", "<=15%", "15–20%", ">20%"],
-                ["Стабильность команды %", "15%", ">=95%", "90–95%", "<90%"],
-                ["Текучесть команды %", "5%", "<=10%", "10–15%", ">15%"],
-            ]
-        )
-    )
-    parts.extend(
-        [
-            _bullet("KPI месяца % и ОКК команды % — обязательные ключевые метрики; без них статус = Недостаточно данных."),
-            _bullet("Если доступно меньше 60% веса управленческих метрик, статус = Недостаточно данных."),
-            _bullet("Красная зона метрики дает 0 за свой вес; желтая зона начисляется линейно до зеленого порога."),
-            _bullet("Статус: Стабильно при балле >=90% и без желтых/красных управленческих флагов; Зона риска при балле <80%; остальные достаточные случаи = Контроль."),
-            _bullet("Причина статуса СВ показывает только красные флаги через запятую; если все метрики зеленые — Все метрики выше целевого уровня; если красных нет — поле пустое."),
-            _bullet("Стабильность команды % = 1 - 70% * доля вакансий от плановой команды - 20% * текучесть - 10% * чистый отток."),
-        ]
-    )
-
-    _section(parts, "7. Супервайзеры — личная эффективность и ОЭД")
-    parts.append(_paragraph("Личная эффективность находится в той же витрине page5_sv_monthly_snapshot; отдельная квартальная ОЭД-витрина — page5_sv_oed_quarterly и oed_quarterly_snapshot."))
-    parts.append(
-        _table(
-            [
-                ["Метрика", "Вес", "Зеленая зона", "Желтая зона", "Красная зона"],
-                ["Аттестация клиента %", "40%", ">=95%", ">90% и <95%", "<90%"],
-                ["Аттестация ОЭД %", "20%", ">=95%", ">90% и <95%", "<90%"],
-                ["Продукт ОЭД %", "20%", ">=95%", ">90% и <95%", "<90%"],
-                ["Управление ОЭД %", "20%", ">=95%", ">90% и <95%", "<90%"],
-            ]
-        )
-    )
-    parts.extend(
-        [
-            _bullet("KPI ОЭД % пока справочно и не входит в балл личной эффективности."),
-            _bullet("Если сотрудник не участвовал в ОЭД как СВ, ОЭД-блоки не заполняются нулями; статус личной эффективности = Новичок."),
-            _bullet("Высокая личная готовность возможна только при балле >=95%, всех зеленых личных метриках и Класс ОЭД = ТОП."),
-            _bullet("Соответствует роли: балл >=90% и нет красных личных флагов."),
-            _bullet("Зона развития: балл <90% или есть красный личный флаг."),
-        ]
-    )
-
-    _section(parts, "8. Страница 6: ОКК и фрод")
-    parts.append(_paragraph("Витрины: page6_okk_region_monthly и page6_okk_insights_monthly."))
-    parts.extend(
-        [
-            _bullet("page6_okk_region_monthly: месяц + регион; ОКК %, Фрод %, OSA %, PICOS % считаются средними из okk_fact."),
-            _bullet("% из проверок ОКК в блоках анкеты = среднее значение выбранного блока ОКК по худшей зоне месяца."),
-            _bullet("KPI-разрыв % = KPI проекта % - целевой KPI 75%; отрицательное значение означает недовыполнение цели."),
-            _bullet("Просадка ОКК % = среднее ОКК без нарушения - среднее ОКК с нарушением. Это доля, форматировать как %."),
-            _bullet("Сигналы формируются автоматически: повторяемый фрод у СВ, падение ОКК раньше KPI, слабые PICOS/OSA, низкое фото при высоком фроде."),
-        ]
-    )
-
-    _section(parts, "9. Страница 7: территориальные менеджеры")
-    parts.append(_paragraph("Витрина: page7_tm_monthly_snapshot. Одна строка = месяц + ТМ; регионы ТМ выводятся списком, региональный слайсер на этой странице мягкий."))
-    parts.append(
-        _table(
-            [
-                ["Метрика", "Вес", "Зеленая зона", "Желтая зона", "Красная зона"],
-                ["KPI месяца территории %", "30%", ">=95%", "90–95%", "<90%"],
-                ["Качество команды %", "20%", ">=80%", "70–80%", "<70%"],
-                ["Обучение команды %", "15%", ">=95%", "90–95%", "<90%"],
-                ["Фрод %", "15%", "<=10%", "10–18%", ">18%"],
-                ["Стабильность команды %", "15%", ">=95%", "90–95%", "<90%"],
-                ["Текучесть %", "5%", "<=10%", "10–15%", ">15%"],
-            ]
-        )
-    )
-    parts.extend(
-        [
-            _bullet("KPI месяца территории % и Качество команды % — обязательные; без них статус = Недостаточно данных."),
-            _bullet("Если второстепенная метрика отсутствует, ее вес перераспределяется между доступными метриками; если доступно меньше 60% веса, статус = Недостаточно данных."),
-            _bullet("Статус ТМ: Стабильно при балле >=80% и достаточных данных; Зона риска при балле <80%; Недостаточно данных при нехватке данных."),
-            _bullet("Причина статуса ТМ выводит только красные флаги через запятую; желтые флаги причину не заполняют."),
-            _bullet("Личные метрики ТМ — обучение ТМ %, средний балл теста, стаж — справочные и не входят в управленческий балл."),
-        ]
-    )
-
-    _section(parts, "10. Страница 8: обучение и компетенции")
-    parts.append(_paragraph("Витрины: page8_learning_course_summary, page8_learning_effect_trend, page8_learning_employee_matrix."))
-    parts.extend(
-        [
-            _bullet("Матрица компетенций строится по активным H&N МЕ из USERS; компетенция = 1, если закрыт курс из согласованного маппинга, иначе 0."),
-            _bullet("% закрытых компетенций = Закрыто компетенций / 6."),
-            _bullet("Эффект курса считается относительно месяца прохождения: до = предыдущий месяц, после 30 = текущий месяц, после 60 = следующий месяц."),
-            _bullet("Комбинированный эффект = 65% * Эффект KPI % + 35% * Эффект ОКК %; если доступна только одна метрика, используется она."),
-            _bullet("Статус курса: подтвержден >=5%; умеренный эффект >=2%; эффект не подтвержден от -2% до +2%; отрицательная динамика < -2%; в процессе замера если курс свежий."),
-        ]
-    )
-
-    _section(parts, "11. Страница 9: анонимный климат")
-    parts.append(_paragraph("Витрины: page9_climate_quarterly_region и page9_climate_blocks_region. Источник — enps_fact, только агрегированные срезы."))
-    parts.extend(
-        [
-            _bullet("Статус региона по климату считается только при минимум 10 ответах."),
-            _bullet("Высокий риск: риск ухода >=24% или удовлетворенность <55%."),
-            _bullet("Контроль: риск ухода >=18% или удовлетворенность <63%."),
-            _bullet("Стабильно: условия риска и контроля не выполнены."),
-            _bullet("Предупреждения QA по Центру/Дальнему Востоку оставлены как исторический eNPS-периметр; в рабочем dRegion их нет."),
-        ]
-    )
-
-    _section(parts, "12. Контроль QA")
-    parts.extend(
-        [
-            _bullet("Скрипт проверки: scripts/audit_vitrines.py."),
-            _bullet("Итоговый отчет: data/out/qa_vitrines_report.xlsx."),
-            _bullet(f"Текущие статусы Page1: {_safe_status_counts(out_dir / 'page1_region_monthly_snapshot.parquet', 'Статус региона')}."),
-            _bullet(f"Текущие статусы Page5: {_safe_status_counts(out_dir / 'page5_sv_monthly_snapshot.parquet', 'Статус эффективности СВ')}."),
-            _bullet(f"Текущие статусы Page7: {_safe_status_counts(out_dir / 'page7_tm_monthly_snapshot.parquet', 'Статус ТМ')}."),
-        ]
-    )
-
+    run_id, as_of_date, created_at = _manifest_summary(out_dir)
+    parts: list[str] = [
+        _paragraph("HN BI: методология, источники и BPMN-спецификация", "Title"),
+        _paragraph(f"Дата документа: {datetime.now():%d.%m.%Y %H:%M}"),
+        _paragraph(f"Версия данных: run_id={run_id}; дата расчёта={as_of_date}; публикация={created_at}."),
+        _paragraph("Назначение: единый паспорт входов, преобразований, формул, проверок и выходов."),
+    ]
+    _section(parts, "1. Итог аудита методологии")
+    parts.extend([
+        _bullet("Предыдущая Word-версия была устаревшей: старые веса, статусы, привязки и удалённые технические витрины."),
+        _bullet("Эта версия сверена с текущими parsers/builders, config/settings.yml, fallback_policy и опубликованными parquet."),
+        _bullet("Описана фактическая реализация на дату манифеста, а не планируемая логика."),
+    ])
+    _section(parts, "2. BPMN-пулы и дорожки")
+    parts.append(_table([
+        ["Дорожка", "Ответственность", "Результат"],
+        ["Владельцы источников", "размещают утверждённые файлы", "входные данные"],
+        ["Парсеры", "читают форматы, даты, ID, проценты, дубли", "нормализованные факты"],
+        ["Идентификация", "связывает сотрудника, ТТ, СВ, ТМ, регион", "контролируемые ключи"],
+        ["Расчётные витрины", "применяет формулы и пороги", "страничные показатели"],
+        ["QA и публикация", "проверяет и атомарно публикует", "data/out"],
+        ["Power BI", "загружает только опубликованные таблицы", "дашборд"],
+    ]))
+    _section(parts, "3. Реестр входов")
+    parts.append(_table(_source_registry()))
+    _add_common_rules(parts)
+    _add_kpi_methodology(parts)
+    _add_page1(parts)
+    _add_page2(parts)
+    _add_page3(parts)
+    _add_page4(parts)
+    _add_page5(parts)
+    _add_page6(parts)
+    _add_page7(parts)
+    _add_page8(parts)
+    _add_page9(parts)
+    _add_staffing(parts)
+    _add_bpmn_control(parts, settings)
+    _section(parts, "17. Последовательность полного ETL")
+    parts.append(_table(_etl_steps()))
+    _add_limitations(parts)
+    _section(parts, "19. Реестр выходов Power BI")
+    parts.append(_table(_published_catalog(out_dir, settings)))
+    _section(parts, "20. Матрица вход → преобразование → выход")
+    parts.append(_table([
+        ["Вход", "Преобразование", "Выход"],
+        ["USERS", "активность, роли, менеджер, Регион BI", "dim_employees, dim_teams, dSupervisor, dTM"],
+        ["client KPI + RTM + логины + ТТ→ТМ", "KPI-схема и подтверждённые визиты", "Page1–Page5, Page7, Page8"],
+        ["ОКК", "качество, нарушения, фрод", "Page1–Page8"],
+        ["обучение + карта", "обязательное обучение и компетенции", "learning_monthly, Page1, Page3, Page5, Page7, Page8"],
+        ["HR + вакансии + USERS", "численность, найм, увольнения, вакансии", "org_staffing, Page1, Page5, Page7"],
+        ["ОЭД + аттестации", "периодические личные показатели", "Page1, Page3, Page5"],
+        ["eNPS", "климат и риск", "Page1, Page2, Page9"],
+    ]))
     _write_docx(parts, OUTPUT_DOCX)
     return OUTPUT_DOCX
 
 
 def main() -> None:
-    output_path = build_document()
-    print(f"Сформировано: {output_path}")
+    print(f"Сформировано: {build_document()}")
 
 
 if __name__ == "__main__":

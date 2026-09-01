@@ -1,10 +1,12 @@
 import re
 import pandas as pd
 from pathlib import Path
-from scripts.utils import load_settings, save_parquet, normalize_dim
+from scripts.utils import load_settings, normalize_dim, normalize_employee_id, save_parquet
 
 
 # ── Вспомогательные функции ──────────────────────────────────────────────────
+
+_normalize_id = normalize_employee_id
 
 def detect_period(filename: str) -> tuple[str, int, int]:
     """Q1_2026.xlsx → ("Q1_2026", 2026, 1)."""
@@ -13,12 +15,6 @@ def detect_period(filename: str) -> tuple[str, int, int]:
     if not m:
         return stem, 0, 0
     return stem, int(m.group(2)), int(m.group(1))
-
-
-def _normalize_id(val) -> str:
-    if pd.isna(val):
-        return ""
-    return str(val).strip().upper()
 
 
 def _normalize_name(val) -> str:
@@ -67,10 +63,6 @@ def _match_row_with_method(id_raw, fio_raw, id_lookup, name_lookup, partial_look
         if key in partial_lookup:
             return partial_lookup[key], "by_name_partial"
     return "", "unmatched"
-
-
-def _match_row(id_raw, fio_raw, id_lookup, name_lookup, partial_lookup) -> str:
-    return _match_row_with_method(id_raw, fio_raw, id_lookup, name_lookup, partial_lookup)[0]
 
 
 # ── Загрузка одного файла ─────────────────────────────────────────────────────
@@ -358,5 +350,3 @@ def parse_oed(dim: pd.DataFrame = None) -> None:
     print(f"\n  ОЭД итого: {total} строк, совпало {matched} ({matched/total*100:.1f}%)")
     churn = fact_oed["churn_risk"].sum()
     print(f"  churn_risk: {churn} сотрудников в зоне риска")
-
-
