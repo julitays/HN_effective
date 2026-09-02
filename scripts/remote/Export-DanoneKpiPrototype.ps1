@@ -57,7 +57,13 @@ function Export-ReadOnlyQuery {
         $connection.Open()
         $reader = $command.ExecuteReader()
         $table.Load($reader)
-        $table | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+        if ($table.Rows.Count -eq 0) {
+            $headers = @($table.Columns | ForEach-Object { $_.ColumnName })
+            New-EmptyCsv -Path $Path -Headers $headers
+        }
+        else {
+            $table | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8
+        }
         return $table.Rows.Count
     }
     finally {
@@ -201,6 +207,10 @@ GROUP BY store.SHIP_TO;
     },
     @{
         Name = 'picos_by_visit.csv'
+        Headers = @(
+            'visit_id', 'store_id', 'visit_date', 'picos_potential',
+            'picos_plan', 'picos_fact', 'picos_execution'
+        )
         Query = @"
 WITH valid_visits AS (
     SELECT DISTINCT VISIT_ID
@@ -216,6 +226,7 @@ picos_visit AS (
         picos.VISIT_ID,
         picos.SHIP_TO,
         CAST(picos.VISIT_DATE AS date) AS VISIT_DATE,
+        SUM(picos.PICOS_POTENTIAL_SCORE) AS PICOS_POTENTIAL,
         SUM(picos.PICOS_TARGET_SCORE) AS PICOS_PLAN,
         SUM(picos.PICOS_SCORE_FACT) AS PICOS_FACT
     FROM dbo.FACT_PICOS picos
@@ -223,12 +234,14 @@ picos_visit AS (
     WHERE picos.VISIT_DATE >= '$periodStartSql'
       AND picos.VISIT_DATE < '$periodEndSql'
     GROUP BY picos.VISIT_ID, picos.SHIP_TO, CAST(picos.VISIT_DATE AS date)
-    HAVING SUM(picos.PICOS_TARGET_SCORE) > 0
+    HAVING SUM(picos.PICOS_POTENTIAL_SCORE) > 0
+       AND SUM(picos.PICOS_TARGET_SCORE) > 0
 )
 SELECT
     VISIT_ID AS visit_id,
     SHIP_TO AS store_id,
     VISIT_DATE AS visit_date,
+    PICOS_POTENTIAL AS picos_potential,
     PICOS_PLAN AS picos_plan,
     PICOS_FACT AS picos_fact,
     CASE

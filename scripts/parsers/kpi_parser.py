@@ -21,14 +21,20 @@ from scripts.staffing_utils import mode_or_first
 from scripts.rtm_utils import load_login_employee_map, load_rtm_employee_visits
 from scripts.kpi_org_mapping import load_current_tm_assignments, attach_kpi_rtm_org
 from scripts.cache_utils import load_or_build_parquet_bundle, source_set_digest
-from scripts.client_sql_exports import load_client_sql_visits
+from scripts.client_sql_exports import load_client_sql_data
 
 
 KPI_METRICS = ("PICOS", "OSA", "TOP16")
 KPI_VALUE_COLUMNS = [
-    f"{metric} {value}"
-    for metric in KPI_METRICS
-    for value in ("план %", "факт %", "выполнение %")
+    "PICOS план",
+    "PICOS факт",
+    "PICOS выполнение %",
+    "OSA план %",
+    "OSA факт %",
+    "OSA выполнение %",
+    "TOP16 план %",
+    "TOP16 факт %",
+    "TOP16 выполнение %",
 ]
 
 
@@ -381,12 +387,14 @@ def _load_client_kpi_file(path: Path, city_region_lookup: dict[str, str]) -> tup
     ].drop_duplicates(["MonthStart", "ТТ"])
 
     for metric in KPI_METRICS:
+        plan_column = "PICOS план" if metric == "PICOS" else f"{metric} план %"
+        fact_column = "PICOS факт" if metric == "PICOS" else f"{metric} факт %"
         metric_rows = long_fact[long_fact["Метрика KPI"].eq(metric)][
             ["MonthStart", "ТТ", "План KPI", "Факт KPI", "Выполнение KPI %"]
         ].rename(
             columns={
-                "План KPI": f"{metric} план %",
-                "Факт KPI": f"{metric} факт %",
+                "План KPI": plan_column,
+                "Факт KPI": fact_column,
                 "Выполнение KPI %": f"{metric} выполнение %",
             }
         )
@@ -461,7 +469,7 @@ def _build_client_tt_fact(
         f"{key}={value}"
         for key, value in sorted(city_region_lookup.items(), key=lambda item: str(item[0]))
     )
-    cache_key = source_set_digest(files, kpi_root, "client-kpi-v1", extra_key=lookup_key)
+    cache_key = source_set_digest(files, kpi_root, "client-kpi-v2", extra_key=lookup_key)
     bundle, cache_hit = load_or_build_parquet_bundle(
         cache_root,
         cache_key,
@@ -470,6 +478,125 @@ def _build_client_tt_fact(
     )
     print(f"  Клиентский KPI: {'кеш parquet' if cache_hit else 'прочитаны Excel'}")
     return bundle["tt"], bundle["long"]
+
+
+def _overlay_sql_picos(
+    tt_fact: pd.DataFrame,
+    tt_long: pd.DataFrame,
+    sql_picos: pd.DataFrame,
+    sql_months: set[int],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if tt_fact.empty:
+        return tt_fact, tt_long
+
+    tt = tt_fact.copy()
+    long = tt_long.copy()
+    assignment = long.loc[
+        long["Метрика KPI"].eq("PICOS"),
+        ["MonthStart", "YearMonth", "ТТ"],
+    ].drop_duplicates()
+    assignment["_PICOS назначен"] = True
+    tt = tt.merge(
+        assignment,
+        on=["MonthStart", "YearMonth", "ТТ"],
+        how="left",
+        validate="one_to_one",
+    )
+    tt["_PICOS назначен"] = tt["_PICOS назначен"].fillna(False).astype(bool)
+
+    picos_columns = [
+        "PICOS план",
+        "PICOS факт",
+        "PICOS выполнение %",
+    ]
+    for column in ["KPI проекта %", *KPI_VALUE_COLUMNS]:
+        tt[column] = pd.to_numeric(tt[column], errors="coerce").astype("float64")
+    tt.loc[:, picos_columns] = np.nan
+    sql_column_lookup = {
+        "PICOS план": "PICOS план SQL",
+        "PICOS факт": "PICOS факт SQL",
+        "PICOS выполнение %": "PICOS выполнение SQL %",
+    }
+
+    if sql_picos.empty:
+        sql_tt = pd.DataFrame(
+            columns=[
+                "MonthStart",
+                "YearMonth",
+                "ТТ",
+                *sql_column_lookup.values(),
+            ]
+        )
+    else:
+        sql_tt = (
+            sql_picos.groupby(
+                ["MonthStart", "YearMonth", "ТТ"],
+                dropna=False,
+                as_index=False,
+            )[
+                list(sql_column_lookup.values())
+            ]
+            .mean()
+        )
+    tt = tt.merge(
+        sql_tt,
+        on=["MonthStart", "YearMonth", "ТТ"],
+        how="left",
+        validate="one_to_one",
+    )
+    assigned_scope = tt["_PICOS назначен"]
+    for column, sql_column in sql_column_lookup.items():
+        tt[sql_column] = pd.to_numeric(tt[sql_column], errors="coerce").astype(
+            "float64"
+        )
+        tt.loc[assigned_scope, column] = tt.loc[assigned_scope, sql_column]
+    tt = tt.drop(columns=list(sql_column_lookup.values()))
+    tt["KPI проекта %"] = _calculate_project_kpi(tt)
+    tt.loc[assigned_scope, "KPI проекта %"] = tt.loc[
+        assigned_scope, "PICOS выполнение %"
+    ]
+
+    replacement = tt.loc[
+        assigned_scope,
+        [
+            "MonthStart",
+            "YearMonth",
+            "ТТ",
+            "Сеть",
+            "Город",
+            "Адрес",
+            "Регион BI",
+            *picos_columns,
+        ],
+    ].copy()
+    replacement["Метрика KPI"] = "PICOS"
+    replacement["Вес KPI"] = 1.0
+    replacement = replacement.rename(
+        columns={
+            "PICOS план": "План KPI",
+            "PICOS факт": "Факт KPI",
+            "PICOS выполнение %": "Выполнение KPI %",
+        }
+    )
+    replacement = replacement[
+        [
+            "MonthStart",
+            "YearMonth",
+            "ТТ",
+            "Сеть",
+            "Город",
+            "Адрес",
+            "Регион BI",
+            "Метрика KPI",
+            "Вес KPI",
+            "План KPI",
+            "Факт KPI",
+            "Выполнение KPI %",
+        ]
+    ]
+    keep_long = ~long["Метрика KPI"].eq("PICOS")
+    long = pd.concat([long.loc[keep_long], replacement], ignore_index=True)
+    return tt, long
 
 
 def _enrich_tt_regions_from_okk(tt_fact: pd.DataFrame, okk: pd.DataFrame) -> pd.DataFrame:
@@ -499,25 +626,43 @@ def _enrich_tt_regions_from_okk(tt_fact: pd.DataFrame, okk: pd.DataFrame) -> pd.
     return merged.drop(columns=["Регион BI okk", "Город okk"], errors="ignore")
 
 
-def _build_merch_kpi_fact(tt_fact: pd.DataFrame, visits: pd.DataFrame, dim: pd.DataFrame) -> pd.DataFrame:
+def _build_merch_kpi_fact(
+    tt_fact: pd.DataFrame,
+    visits: pd.DataFrame,
+    dim: pd.DataFrame,
+) -> pd.DataFrame:
     if tt_fact.empty or visits.empty:
         return pd.DataFrame()
+    if "_PICOS назначен" not in tt_fact.columns:
+        tt_fact = tt_fact.copy()
+        tt_fact["_PICOS назначен"] = False
 
+    visit_aggregations = {
+        "Визиты KPI": ("Ключ визита RTM", "nunique"),
+        "Мерчендайзер": ("ФИО из логинов", "first"),
+        "Логин": ("Логин", "first"),
+        "ID супервайзера": ("ID супервайзера", "first"),
+        "Супервайзер": ("Супервайзер", "first"),
+        "ID территориального менеджера": ("ID территориального менеджера", "first"),
+        "Территориальный менеджер": ("Территориальный менеджер", "first"),
+        "Регион BI RTM": ("Регион BI", "first"),
+    }
+    sql_picos_columns = [
+        "PICOS план SQL",
+        "PICOS факт SQL",
+        "PICOS выполнение SQL %",
+    ]
+    if set(sql_picos_columns).issubset(visits.columns):
+        for column in sql_picos_columns:
+            visit_aggregations[column] = (column, "mean")
+        visit_aggregations["PICOS визиты SQL"] = (
+            "PICOS выполнение SQL %",
+            "count",
+        )
     visits = (
         visits.dropna(subset=["MonthStart", "ТТ", "ID сотрудника"])
         .groupby(["MonthStart", "YearMonth", "ТТ", "ID сотрудника"], dropna=False)
-        .agg(
-            **{
-                "Визиты KPI": ("Ключ визита RTM", "nunique"),
-                "Мерчендайзер": ("ФИО из логинов", "first"),
-                "Логин": ("Логин", "first"),
-                "ID супервайзера": ("ID супервайзера", "first"),
-                "Супервайзер": ("Супервайзер", "first"),
-                "ID территориального менеджера": ("ID территориального менеджера", "first"),
-                "Территориальный менеджер": ("Территориальный менеджер", "first"),
-                "Регион BI RTM": ("Регион BI", "first"),
-            }
-        )
+        .agg(**visit_aggregations)
         .reset_index()
         .rename(columns={"ID сотрудника": "ID мерчендайзера"})
     )
@@ -534,6 +679,7 @@ def _build_merch_kpi_fact(tt_fact: pd.DataFrame, visits: pd.DataFrame, dim: pd.D
                 "KPI проекта %",
                 *KPI_VALUE_COLUMNS,
                 "Регион BI",
+                "_PICOS назначен",
             ]
         ],
         on=["MonthStart", "YearMonth", "ТТ"],
@@ -567,8 +713,30 @@ def _build_merch_kpi_fact(tt_fact: pd.DataFrame, visits: pd.DataFrame, dim: pd.D
             if "Город dim" in merged.columns:
                 merged["Город"] = merged["Город"].combine_first(merged["Город dim"])
 
+    assigned_sql_scope = merged["_PICOS назначен"].fillna(False).astype(bool)
+    sql_column_lookup = {
+        "PICOS план": "PICOS план SQL",
+        "PICOS факт": "PICOS факт SQL",
+        "PICOS выполнение %": "PICOS выполнение SQL %",
+    }
+    for column, sql_column in sql_column_lookup.items():
+        if sql_column in merged.columns:
+            sql_values = pd.to_numeric(
+                merged[sql_column], errors="coerce"
+            ).astype("float64")
+            merged.loc[assigned_sql_scope, column] = sql_values.loc[
+                assigned_sql_scope
+            ]
+    merged["KPI проекта %"] = _calculate_project_kpi(merged)
+    merged.loc[assigned_sql_scope, "KPI проекта %"] = merged.loc[
+        assigned_sql_scope, "PICOS выполнение %"
+    ]
+
     group_columns = ["MonthStart", "YearMonth", "ID мерчендайзера"]
     weights = pd.to_numeric(merged["Визиты KPI"], errors="coerce").fillna(0)
+    picos_weights = pd.to_numeric(
+        merged.get("PICOS визиты SQL", weights), errors="coerce"
+    ).fillna(0)
     grouped = merged.groupby(group_columns, dropna=False, sort=False)
     result = grouped.agg(
         **{
@@ -607,24 +775,28 @@ def _build_merch_kpi_fact(tt_fact: pd.DataFrame, visits: pd.DataFrame, dim: pd.D
     groupers = [merged[column] for column in group_columns]
     for column in ["KPI проекта %", *KPI_VALUE_COLUMNS]:
         values = pd.to_numeric(merged[column], errors="coerce")
-        valid = values.notna() & weights.gt(0)
-        numerator = (values * weights).where(valid).groupby(
+        metric_weights = weights
+        if column.startswith("PICOS") or column == "KPI проекта %":
+            metric_weights = weights.where(~assigned_sql_scope, picos_weights)
+        valid = values.notna() & metric_weights.gt(0)
+        numerator = (values * metric_weights).where(valid).groupby(
             groupers, dropna=False, sort=False
         ).sum(min_count=1)
-        denominator = weights.where(valid).groupby(
+        denominator = metric_weights.where(valid).groupby(
             groupers, dropna=False, sort=False
         ).sum(min_count=1)
         result[column] = numerator / denominator
 
     picos_available = pd.to_numeric(merged["PICOS выполнение %"], errors="coerce").notna()
-    osa_available = ~picos_available & pd.to_numeric(
+    osa_available = ~assigned_sql_scope & ~picos_available & pd.to_numeric(
         merged["OSA выполнение %"], errors="coerce"
     ).notna()
-    top16_available = ~picos_available & pd.to_numeric(
+    top16_available = ~assigned_sql_scope & ~picos_available & pd.to_numeric(
         merged["TOP16 выполнение %"], errors="coerce"
     ).notna()
     valid_scenario = picos_available | osa_available | top16_available
-    valid_visit_weight = weights.where(valid_scenario)
+    scenario_weights = weights.where(~assigned_sql_scope, picos_weights)
+    valid_visit_weight = scenario_weights.where(valid_scenario)
     scenario_denominator = valid_visit_weight.groupby(
         groupers,
         dropna=False,
@@ -642,7 +814,7 @@ def _build_merch_kpi_fact(tt_fact: pd.DataFrame, visits: pd.DataFrame, dim: pd.D
         ),
     }
     for column, factor in component_factors.items():
-        numerator = (weights * factor).where(valid_scenario).groupby(
+        numerator = (scenario_weights * factor).where(valid_scenario).groupby(
             groupers,
             dropna=False,
             sort=False,
@@ -660,6 +832,9 @@ def _build_visit_kpi_timeline(
 ) -> pd.DataFrame:
     if tt_fact.empty or visits.empty:
         return pd.DataFrame()
+    if "_PICOS назначен" not in tt_fact.columns:
+        tt_fact = tt_fact.copy()
+        tt_fact["_PICOS назначен"] = False
 
     visit_columns = [
         "MonthStart",
@@ -675,6 +850,15 @@ def _build_visit_kpi_timeline(
         "Территориальный менеджер",
         "Регион BI",
     ]
+    visit_columns.extend(
+        column
+        for column in [
+            "PICOS план SQL",
+            "PICOS факт SQL",
+            "PICOS выполнение SQL %",
+        ]
+        if column in visits.columns
+    )
     mapped = visits[visit_columns].dropna(
         subset=["MonthStart", "Дата визита", "ТТ", "ID сотрудника"]
     ).copy()
@@ -689,12 +873,29 @@ def _build_visit_kpi_timeline(
                 "Регион BI",
                 "KPI проекта %",
                 *KPI_VALUE_COLUMNS,
+                "_PICOS назначен",
             ]
         ],
         on=["MonthStart", "YearMonth", "ТТ"],
         how="inner",
     )
     mapped["Регион BI"] = mapped.get("Регион BI_x").combine_first(mapped.get("Регион BI_y"))
+    assigned_scope = mapped["_PICOS назначен"].fillna(False).astype(bool)
+    sql_column_lookup = {
+        "PICOS план": "PICOS план SQL",
+        "PICOS факт": "PICOS факт SQL",
+        "PICOS выполнение %": "PICOS выполнение SQL %",
+    }
+    for column, sql_column in sql_column_lookup.items():
+        if sql_column in mapped.columns:
+            sql_values = pd.to_numeric(
+                mapped[sql_column], errors="coerce"
+            ).astype("float64")
+            mapped.loc[assigned_scope, column] = sql_values.loc[assigned_scope]
+    mapped["KPI проекта %"] = _calculate_project_kpi(mapped)
+    mapped.loc[assigned_scope, "KPI проекта %"] = mapped.loc[
+        assigned_scope, "PICOS выполнение %"
+    ]
     mapped["Мерчендайзер"] = mapped["ФИО из логинов"]
     mapped = mapped.rename(
         columns={
@@ -846,7 +1047,6 @@ def parse_kpi(dim: pd.DataFrame = None) -> None:
         return
     phase_started = _log_phase("клиентские KPI-файлы", phase_started)
 
-    tt_fact = _enrich_tt_regions_from_okk(tt_fact, okk)
     active_dim = dim.copy()
     if "Активен" in active_dim.columns:
         active_dim = active_dim[active_dim["Активен"].fillna(False).eq(True)].copy()
@@ -856,9 +1056,23 @@ def parse_kpi(dim: pd.DataFrame = None) -> None:
             kpi_root / "sql_exports",
         )
     )
-    sql_visits, sql_agent_audit, sql_month_audit, sql_months = (
-        load_client_sql_visits(sql_export_root, dim)
+    sql_visits, sql_agent_audit, sql_month_audit, sql_picos, sql_months = (
+        load_client_sql_data(sql_export_root, dim)
     )
+    tt_fact, tt_long = _overlay_sql_picos(
+        tt_fact,
+        tt_long,
+        sql_picos,
+        sql_months,
+    )
+    tt_fact = _enrich_tt_regions_from_okk(tt_fact, okk)
+    if not sql_picos.empty:
+        sql_visits = sql_visits.merge(
+            sql_picos.drop(columns=["MonthStart", "Дата визита PICOS"]),
+            on=["YearMonth", "Ключ визита RTM", "ТТ"],
+            how="left",
+            validate="one_to_one",
+        )
     phase_started = _log_phase("SQL-пакеты визитов", phase_started)
 
     legacy_visits = pd.DataFrame()
@@ -866,7 +1080,10 @@ def parse_kpi(dim: pd.DataFrame = None) -> None:
     legacy_login_audit = pd.DataFrame()
     login_root = kpi_root / "Логины"
     rtm_root = kpi_root / "RTM"
-    if login_root.exists() and rtm_root.exists():
+    legacy_rtm_enabled = bool(
+        settings["sources"]["kpi"].get("legacy_rtm_enabled", False)
+    )
+    if legacy_rtm_enabled and login_root.exists() and rtm_root.exists():
         login_map, legacy_login_audit = load_login_employee_map(
             login_root,
             active_dim,
@@ -899,7 +1116,7 @@ def parse_kpi(dim: pd.DataFrame = None) -> None:
 
     visit_frames = [frame for frame in [legacy_visits, sql_visits] if not frame.empty]
     if not visit_frames:
-        raise FileNotFoundError("Не найдены ни SQL-пакеты визитов, ни исторические RTM")
+        raise FileNotFoundError("Не найдены проверенные SQL-пакеты визитов")
     rtm_visits = pd.concat(visit_frames, ignore_index=True, sort=False)
     rtm_visits = rtm_visits.sort_values(
         ["YearMonth", "Ключ визита RTM", "Источник визитов"],
@@ -934,6 +1151,7 @@ def parse_kpi(dim: pd.DataFrame = None) -> None:
     )
     merch_fact_full = _build_merch_kpi_fact(tt_fact, rtm_visits, dim)
     visit_timeline = _build_visit_kpi_timeline(tt_fact, rtm_visits)
+    tt_fact = tt_fact.drop(columns=["_PICOS назначен"], errors="ignore")
     phase_started = _log_phase("связка KPI / RTM / оргструктура", phase_started)
     merch_fact = merch_fact_full.copy()
     kpi_score_weight_columns = [
@@ -968,7 +1186,15 @@ def parse_kpi(dim: pd.DataFrame = None) -> None:
     save_parquet(merch_history, str(out_dir / "kpi_employee_history_fact.parquet"))
     save_parquet(tt_fact, str(out_dir / "kpi_client_tt_fact.parquet"))
     save_parquet(tt_long, str(out_dir / "kpi_client_tt_long.parquet"))
-    save_parquet(rtm_visits, str(out_dir / "rtm_employee_visits.parquet"))
+    public_rtm_visits = rtm_visits.drop(
+        columns=[
+            "PICOS план SQL",
+            "PICOS факт SQL",
+            "PICOS выполнение SQL %",
+        ],
+        errors="ignore",
+    )
+    save_parquet(public_rtm_visits, str(out_dir / "rtm_employee_visits.parquet"))
     save_parquet(visit_timeline, str(out_dir / "kpi_employee_visit_timeline.parquet"))
     employee_monthly = employee_monthly_source.rename(
         columns={

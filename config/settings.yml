@@ -37,10 +37,10 @@ sources:
   kpi:
     folder: data/raw/kpi
     # Месячные проверенные архивы HN_KPI_YYYYMM.zip из клиентской SQL-базы.
-    # Если пакет месяца присутствует, он является единственным источником визитов
-    # этого месяца; Excel RTM и файлы логинов используются только для остальных
-    # исторических месяцев.
+    # Проверенные SQL-пакеты являются единственным источником визитов.
+    # Исторические Excel RTM и файлы логинов отключены.
     sql_export_folder: data/raw/kpi/sql_exports
+    legacy_rtm_enabled: false
     output: data/out/kpi_fact.parquet
   users:
     source: corporate_university

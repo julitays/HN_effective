@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -197,6 +198,184 @@ REQUIRED_COLUMNS = {
 }
 
 
+KPI_COMPONENT_COLUMNS = [
+    "PICOS план",
+    "PICOS факт",
+    "PICOS выполнение %",
+    "OSA план %",
+    "OSA факт %",
+    "OSA выполнение %",
+    "TOP16 план %",
+    "TOP16 факт %",
+    "TOP16 выполнение %",
+]
+
+
+PUBLISHED_REQUIRED_COLUMNS = {
+    "dim_employees": ["ID сотрудника", "ФИО", "Должность", "Проект", "Дата приёма", "Активен", "Регион BI"],
+    "dim_teams": ["ID территориального менеджера", "ID супервайзера", "ID мерчендайзера", "Регион BI"],
+    "dMonth": ["MonthStart", "YearMonth", "MonthLabel"],
+    "dRegion": ["Регион BI"],
+    "dSupervisor": ["ID супервайзера", "Супервайзер", "Регион BI", "Территориальный менеджер"],
+    "dTM": ["ID территориального менеджера", "Территориальный менеджер", "Регион BI", "Регионы ТМ"],
+    "learning_monthly": ["YearMonth", "Регион BI", "Назначено обязательных курсов", "Пройдено обязательных курсов"],
+    "okk_fact": ["Качество визита", "Регион BI", "YearMonth"],
+    "org_staffing_report_snapshot": [
+        "YearMonth",
+        "Регион BI",
+        "Активных МЕ",
+        "Открытых вакансий",
+        "Нанято",
+        "Уволено",
+        "Доля кадрового оттока %",
+    ],
+    "page1_region_monthly_snapshot": [
+        "YearMonth",
+        "Регион BI",
+        "KPI проекта %",
+        "PICOS выполнение %",
+        "OSA выполнение %",
+        "TOP16 выполнение %",
+        "Качество визитов %",
+        "Фрод %",
+        "Обязательное обучение %",
+        "Кадровая устойчивость %",
+        "Статус региона",
+        "Текст приоритета",
+    ],
+    "page2_actions_monthly": ["Что сделать", "Ответственный контур", "Сейчас", "Цель", "YearMonth"],
+    "page2_sv_monthly_snapshot": [
+        "YearMonth",
+        "Регион BI",
+        "Территориальный менеджер",
+        "СВ / Объект",
+        "KPI проекта %",
+        "PICOS план",
+        "PICOS факт",
+        "Первое действие",
+    ],
+    "page3_merch_monthly_snapshot": [
+        "YearMonth",
+        "Мерчендайзер",
+        "Регион BI",
+        "Супервайзер",
+        "Территориальный менеджер",
+        "ОКК %",
+        "Обучение %",
+        "Статус личной эффективности",
+        "Причина личной эффективности",
+        *KPI_COMPONENT_COLUMNS,
+    ],
+    "page4_tt_formula": ["Порядок", "Формула", "Описание"],
+    "page4_tt_monthly_snapshot": [
+        "MonthStart",
+        "ТТ",
+        "Регион BI",
+        "Сеть",
+        "ТМ территория",
+        "Визиты",
+        "ОКК %",
+        "Сложность %",
+        "Статус ТТ",
+        *KPI_COMPONENT_COLUMNS,
+    ],
+    "page4_tt_status_legend": ["Порядок", "Статус ТТ", "Описание"],
+    "page5_sv_monthly_snapshot": [
+        "YearMonth",
+        "ID супервайзера",
+        "Супервайзер",
+        "Территориальный менеджер",
+        "Размер команды",
+        "Текучесть команды %",
+        "Стабильность команды %",
+        "ОКК команды %",
+        "Обучение команды %",
+        "Фрод %",
+        "Балл эффективности",
+        "Статус эффективности СВ",
+        "Причина статуса СВ",
+        "Балл личной эффективности",
+        "Статус личной эффективности",
+        "Причина личной эффективности",
+        *KPI_COMPONENT_COLUMNS,
+    ],
+    "page6_okk_insights_monthly": [
+        "YearMonth",
+        "Регион BI",
+        "Тип блока",
+        "Категория",
+        "Показатель",
+        "% из проверок ОКК",
+        "Фрод %",
+        "Просадка ОКК %",
+        "Риск",
+        "Действие",
+    ],
+    "page6_okk_region_monthly": ["YearMonth", "Регион BI", "ОКК %"],
+    "page7_tm_monthly_snapshot": [
+        "MonthStart",
+        "ID территориального менеджера",
+        "Территориальный менеджер",
+        "Регион BI",
+        "Балл эффективности",
+        "Статус ТМ",
+        "Причина статуса ТМ",
+        "Результат территории %",
+        "Стабильность команды %",
+        "Качество команды %",
+        "Обучение команды %",
+        "Фрод %",
+        "Текучесть %",
+        *KPI_COMPONENT_COLUMNS,
+    ],
+    "page8_learning_course_summary": [
+        "YearMonth",
+        "Месяц обучения",
+        "Регион BI",
+        "Территориальный менеджер",
+        "ID супервайзера",
+        "СВ",
+        "ID сотрудника",
+        "Новичок",
+        "Дата приёма",
+        "Стаж, мес.",
+        "Обязательное обучение закрыто %",
+        "ОКК 1-й месяц",
+        "ОКК 2-й месяц",
+        "Готовность новичка %",
+        "Статус адаптации",
+    ],
+    "page8_learning_employee_matrix": [
+        "YearMonth",
+        "Регион BI",
+        "Территориальный менеджер",
+        "ID супервайзера",
+        "СВ",
+        "Сотрудник",
+        "Фотоаудит",
+        "Доступность",
+        "PICOS",
+        "Антифрод",
+        "Работа с ТТ",
+        "Базовые стандарты",
+        "% закрытых компетенций",
+        "Незакрытая компетенция",
+    ],
+    "page9_climate_blocks_region": ["Регион BI", "Блок", "Значение %", "Предыдущий период %"],
+    "page9_climate_quarterly_region": [
+        "QuarterStart",
+        "QuarterLabel",
+        "Регион BI",
+        "Удовлетворённость %",
+        "Вовлечённость %",
+        "Лояльность %",
+        "Риск ухода %",
+        "eNPS",
+        "Статус",
+    ],
+}
+
+
 KEYS = {
     "page1_region_monthly_snapshot": ["YearMonth", "Регион BI"],
     "page2_sv_monthly_snapshot": ["YearMonth", "ID супервайзера"],
@@ -207,6 +386,21 @@ KEYS = {
     "page8_learning_course_summary": ["YearMonth", "ID сотрудника"],
     "page8_learning_effect_trend": ["YearMonth", "Регион BI", "ID территориального менеджера", "СВ", "Шаг"],
     "page8_learning_employee_matrix": ["YearMonth", "ID сотрудника"],
+    "dSupervisor": ["ID супервайзера"],
+    "dTM": ["ID территориального менеджера"],
+    "dRegion": ["Регион BI"],
+}
+
+
+PUBLISHED_KEYS = {
+    "page1_region_monthly_snapshot": ["YearMonth", "Регион BI"],
+    "page2_sv_monthly_snapshot": ["YearMonth", "СВ / Объект"],
+    "page3_merch_monthly_snapshot": ["YearMonth", "Мерчендайзер"],
+    "page4_tt_monthly_snapshot": ["MonthStart", "ТТ"],
+    "page5_sv_monthly_snapshot": ["YearMonth", "ID супервайзера"],
+    "page7_tm_monthly_snapshot": ["MonthStart", "ID территориального менеджера"],
+    "page8_learning_course_summary": ["YearMonth", "ID сотрудника"],
+    "page8_learning_employee_matrix": ["YearMonth", "Сотрудник"],
     "dSupervisor": ["ID супервайзера"],
     "dTM": ["ID территориального менеджера"],
     "dRegion": ["Регион BI"],
@@ -245,8 +439,18 @@ def _clean_reason(value):
 class Audit:
     def __init__(self, out_dir: Path):
         self.out_dir = out_dir
+        self.settings = load_settings()
+        self.published_mode = (out_dir / "etl_run_manifest.json").exists()
         self.tables: dict[str, pd.DataFrame] = {}
         self.rows: list[dict] = []
+
+    def _required_tables(self) -> dict[str, str]:
+        if not self.published_mode:
+            return REQUIRED_TABLES
+        return {
+            Path(filename).stem: filename
+            for filename in self.settings["reporting"]["publish_tables"]
+        }
 
     def add(self, level: str, table: str, check: str, details: str = "", count: int | None = None) -> None:
         self.rows.append(
@@ -260,7 +464,7 @@ class Audit:
         )
 
     def load_tables(self) -> None:
-        for table, filename in REQUIRED_TABLES.items():
+        for table, filename in self._required_tables().items():
             path = self.out_dir / filename
             if not path.exists():
                 self.add("ERROR", table, "Файл существует", f"Не найден {path}", 1)
@@ -270,7 +474,10 @@ class Audit:
             self.add("OK", table, "Файл существует", f"{len(frame)} строк, {len(frame.columns)} колонок")
 
     def check_required_columns(self) -> None:
-        for table, columns in REQUIRED_COLUMNS.items():
+        required_columns = (
+            PUBLISHED_REQUIRED_COLUMNS if self.published_mode else REQUIRED_COLUMNS
+        )
+        for table, columns in required_columns.items():
             frame = self.tables.get(table)
             if frame is None:
                 continue
@@ -281,7 +488,8 @@ class Audit:
                 self.add("OK", table, "Обязательные колонки", "Все на месте")
 
     def check_keys(self) -> None:
-        for table, keys in KEYS.items():
+        keys_by_table = PUBLISHED_KEYS if self.published_mode else KEYS
+        for table, keys in keys_by_table.items():
             frame = self.tables.get(table)
             if frame is None:
                 continue
@@ -299,6 +507,93 @@ class Audit:
                 self.add("ERROR", table, "Дубли ключей", f"Ключ: {', '.join(keys)}", int(duplicate_rows))
             else:
                 self.add("OK", table, "Дубли ключей", f"Ключ: {', '.join(keys)}")
+
+    def check_published_output_contract(self) -> None:
+        if not self.published_mode:
+            return
+        expected_files = {
+            filename
+            for filename in self.settings["reporting"]["publish_tables"]
+        }
+        actual_files = {path.name for path in self.out_dir.glob("*.parquet")}
+        missing_files = sorted(expected_files - actual_files)
+        extra_files = sorted(actual_files - expected_files)
+        if missing_files:
+            self.add(
+                "ERROR",
+                "Power BI",
+                "Согласованный набор файлов",
+                "Отсутствуют: " + ", ".join(missing_files),
+                len(missing_files),
+            )
+        if extra_files:
+            self.add(
+                "ERROR",
+                "Power BI",
+                "Технические parquet",
+                "Лишние: " + ", ".join(extra_files),
+                len(extra_files),
+            )
+        if not missing_files and not extra_files:
+            self.add(
+                "OK",
+                "Power BI",
+                "Согласованный набор файлов",
+                f"Опубликовано {len(actual_files)} таблицы",
+            )
+
+        cleanup_path = Path(
+            self.settings["reporting"]["powerbi_column_contract"]
+        )
+        cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
+        leftovers: list[str] = []
+        for table, configured_columns in cleanup.get("columns", {}).items():
+            frame = self.tables.get(table)
+            if frame is None:
+                continue
+            for column in configured_columns:
+                if column in frame.columns:
+                    leftovers.append(f"{table}[{column}]")
+        if leftovers:
+            self.add(
+                "ERROR",
+                "Power BI",
+                "Технические колонки",
+                ", ".join(leftovers),
+                len(leftovers),
+            )
+        else:
+            self.add(
+                "OK",
+                "Power BI",
+                "Технические колонки",
+                "Колонки из плана очистки отсутствуют",
+            )
+
+        old_kpi_columns = {"PICOS план %", "PICOS факт %"}
+        old_kpi_leftovers = [
+            f"{table}[{column}]"
+            for table, frame in self.tables.items()
+            for column in frame.columns
+            if column in old_kpi_columns
+            or str(column).endswith(" SQL")
+            or "potential" in str(column).lower()
+        ]
+        if old_kpi_leftovers:
+            self.add(
+                "ERROR",
+                "Power BI",
+                "Старые KPI-колонки",
+                ", ".join(old_kpi_leftovers),
+                len(old_kpi_leftovers),
+            )
+        else:
+            self.add(
+                "OK",
+                "Power BI",
+                "Старые KPI-колонки",
+                "Старые и технические KPI-поля отсутствуют",
+            )
 
     def check_percent_types_and_ranges(self) -> None:
         for table, frame in self.tables.items():
@@ -374,6 +669,8 @@ class Audit:
                 self.add(level, table, "Региональный периметр", ", ".join(extra), len(extra))
 
     def check_page1_formulas(self) -> None:
+        if self.published_mode:
+            return
         frame = self.tables.get("page1_region_monthly_snapshot")
         if frame is None:
             return
@@ -414,6 +711,8 @@ class Audit:
             self.add("OK", "page1_region_monthly_snapshot", "Fallback приоритетов", "Стабильные и недостаточные регионы не выводятся")
 
     def check_page3_formulas(self) -> None:
+        if self.published_mode:
+            return
         frame = self.tables.get("page3_merch_monthly_snapshot")
         if frame is None:
             return
@@ -463,6 +762,8 @@ class Audit:
                 self.add("OK", "page3_merch_monthly_snapshot", f"Формула: {column}", "Совпадает")
 
     def check_page5_formulas(self) -> None:
+        if self.published_mode:
+            return
         frame = self.tables.get("page5_sv_monthly_snapshot")
         if frame is None:
             return
@@ -534,6 +835,8 @@ class Audit:
                 self.add("OK", "page5_sv_monthly_snapshot", f"Формула: {column}", "Совпадает")
 
     def check_page7_formulas(self) -> None:
+        if self.published_mode:
+            return
         frame = self.tables.get("page7_tm_monthly_snapshot")
         if frame is None:
             return
@@ -633,6 +936,8 @@ class Audit:
                 )
 
     def check_page8_hire_date(self) -> None:
+        if self.published_mode:
+            return
         frame = self.tables.get("page8_learning_course_summary")
         required = {"MonthStart", "Дата приёма"}
         if frame is None or required.difference(frame.columns):
@@ -755,6 +1060,7 @@ class Audit:
         self.load_tables()
         self.check_required_columns()
         self.check_keys()
+        self.check_published_output_contract()
         self.check_percent_types_and_ranges()
         self.check_status_values()
         self.check_region_scope()
@@ -785,6 +1091,8 @@ def main() -> None:
     if not warnings.empty:
         print("\nПредупреждения:")
         print(warnings[["Таблица", "Проверка", "Количество", "Детали"]].to_string(index=False))
+    if not errors.empty:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import re
 import zipfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from scripts.staffing_utils import normalize_name, short_name
@@ -29,10 +30,23 @@ def _clean_code(series: pd.Series) -> pd.Series:
     return result.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "<NA>": pd.NA})
 
 
+def _to_numeric(series: pd.Series) -> pd.Series:
+    cleaned = (
+        series.astype("string")
+        .str.replace("\xa0", " ", regex=False)
+        .str.replace(",", ".", regex=False)
+        .str.strip()
+    )
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
 def _read_csv(archive: zipfile.ZipFile, name: str) -> pd.DataFrame:
     with archive.open(name) as source:
         with io.TextIOWrapper(source, encoding="utf-8-sig", newline="") as text:
-            return pd.read_csv(text, dtype="string")
+            try:
+                return pd.read_csv(text, dtype="string")
+            except pd.errors.EmptyDataError:
+                return pd.DataFrame()
 
 
 def _unique_lookup(keys: pd.Series, employee_ids: pd.Series) -> dict[str, str]:
@@ -68,7 +82,12 @@ def _validate_manifest(
         raise ValueError(f"SQL-пакет {archive_path.name}: некорректный manifest.csv")
     manifest["rows"] = pd.to_numeric(manifest["rows"], errors="coerce").astype("Int64")
     manifest_rows = manifest.set_index("file")["rows"].to_dict()
-    for name in REQUIRED_FILES - {"manifest.csv"}:
+    manifest_data_files = REQUIRED_FILES - {
+        "manifest.csv",
+        "errors.csv",
+        "warnings.csv",
+    }
+    for name in manifest_data_files:
         expected = manifest_rows.get(name)
         if expected is None:
             raise ValueError(f"SQL-пакет {archive_path.name}: {name} отсутствует в manifest.csv")
@@ -84,7 +103,7 @@ def _load_month_archive(
     archive_path: Path,
     year_month: int,
     dim_employees: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict, pd.DataFrame]:
     with zipfile.ZipFile(archive_path) as archive:
         members = {Path(name).name: name for name in archive.namelist() if not name.endswith("/")}
         missing = sorted(REQUIRED_FILES - set(members))
@@ -99,6 +118,7 @@ def _load_month_archive(
     visits = frames["visits.csv"].copy()
     agents = frames["agents.csv"].copy()
     stores = frames["stores.csv"].copy()
+    picos = frames["picos_by_visit.csv"].copy()
 
     expected_visit_columns = {
         "visit_id",
@@ -248,6 +268,84 @@ def _load_month_archive(
     result["Сеть SQL"] = visits["network_name"].astype("string")
     result["Формат ТТ SQL"] = visits["store_format"].astype("string")
 
+    expected_picos_columns = {
+        "visit_id",
+        "store_id",
+        "visit_date",
+        "picos_potential",
+        "picos_plan",
+        "picos_fact",
+        "picos_execution",
+    }
+    if picos.empty and not len(picos.columns):
+        picos = pd.DataFrame(columns=sorted(expected_picos_columns))
+    if not expected_picos_columns.issubset(picos.columns):
+        missing = sorted(expected_picos_columns - set(picos.columns))
+        raise ValueError(
+            f"SQL-пакет {archive_path.name}: picos_by_visit.csv без полей {missing}"
+        )
+    picos["visit_id"] = _clean_code(picos["visit_id"])
+    picos["store_id"] = _clean_code(picos["store_id"])
+    picos["visit_date"] = pd.to_datetime(
+        picos["visit_date"], errors="coerce", dayfirst=True
+    ).dt.normalize()
+    for column in ["picos_potential", "picos_plan", "picos_fact", "picos_execution"]:
+        picos[column] = _to_numeric(picos[column])
+    if not picos.empty:
+        required_picos_values = [
+            "visit_id",
+            "store_id",
+            "visit_date",
+            "picos_potential",
+            "picos_plan",
+            "picos_fact",
+        ]
+        if picos[required_picos_values].isna().any().any():
+            raise ValueError(
+                f"SQL-пакет {archive_path.name}: обязательные поля PICOS содержат пустые значения"
+            )
+        if picos["visit_id"].duplicated().any():
+            raise ValueError(
+                f"SQL-пакет {archive_path.name}: PICOS содержит повторяющиеся visit_id"
+            )
+        picos_months = set(
+            (picos["visit_date"].dt.year * 100 + picos["visit_date"].dt.month)
+            .dropna()
+            .astype(int)
+        )
+        if picos_months != {year_month}:
+            raise ValueError(
+                f"SQL-пакет {archive_path.name}: даты PICOS относятся к месяцам {sorted(picos_months)}"
+            )
+        if picos["picos_potential"].le(0).any() or picos["picos_plan"].le(0).any():
+            raise ValueError(
+                f"SQL-пакет {archive_path.name}: PICOS содержит неположительный потенциал или план"
+            )
+
+    picos_ratio = (picos["picos_fact"] / picos["picos_plan"]).round(10)
+    picos_execution_pct = pd.Series(np.nan, index=picos.index, dtype="float64")
+    valid_picos = picos_ratio.notna()
+    picos_execution_pct.loc[valid_picos & picos_ratio.lt(0.75)] = 0.0
+    picos_execution_pct.loc[valid_picos & picos_ratio.ge(0.75)] = picos_ratio.loc[
+        valid_picos & picos_ratio.ge(0.75)
+    ].clip(upper=1.0)
+    picos_result = pd.DataFrame(
+        {
+            "YearMonth": pd.Series(year_month, index=picos.index, dtype="Int64"),
+            "MonthStart": pd.Timestamp(
+                year=year_month // 100,
+                month=year_month % 100,
+                day=1,
+            ),
+            "Ключ визита RTM": picos["visit_id"],
+            "Дата визита PICOS": picos["visit_date"],
+            "ТТ": picos["store_id"],
+            "PICOS план SQL": picos["picos_plan"],
+            "PICOS факт SQL": picos["picos_fact"],
+            "PICOS выполнение SQL %": picos_execution_pct,
+        }
+    )
+
     audit = {
         "YearMonth": year_month,
         "Источник визитов": "SQL клиента",
@@ -260,16 +358,10 @@ def _load_month_archive(
         "Уникальных ТТ": result["ТТ"].nunique(),
         "Предупреждений пакета": len(frames["warnings.csv"]),
     }
-    return result, agent_audit, audit
+    return result, agent_audit, audit, picos_result
 
 
-def load_client_sql_visits(
-    export_root: Path,
-    dim_employees: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, set[int]]:
-    if not export_root.exists():
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), set()
-
+def _discover_archives(export_root: Path) -> dict[int, Path]:
     archives: dict[int, Path] = {}
     for path in sorted(export_root.glob("HN_KPI_*.zip")):
         match = ARCHIVE_PATTERN.match(path.name)
@@ -279,25 +371,56 @@ def load_client_sql_visits(
         if year_month in archives:
             raise ValueError(f"Найдено несколько SQL-пакетов за {year_month}")
         archives[year_month] = path
+    return archives
+
+
+def load_client_sql_data(
+    export_root: Path,
+    dim_employees: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, set[int]]:
+    if not export_root.exists():
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), set()
+
+    archives = _discover_archives(export_root)
     if not archives:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), set()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), set()
 
     visit_frames = []
     agent_audits = []
     month_audits = []
+    picos_frames = []
     for year_month, path in sorted(archives.items()):
-        visits, agents, audit = _load_month_archive(path, year_month, dim_employees)
+        visits, agents, audit, picos = _load_month_archive(
+            path, year_month, dim_employees
+        )
         visit_frames.append(visits)
         agent_audits.append(agents)
         month_audits.append(audit)
+        picos_frames.append(picos)
 
     all_visits = pd.concat(visit_frames, ignore_index=True)
     duplicate_keys = all_visits.duplicated(["YearMonth", "Ключ визита RTM"])
     if duplicate_keys.any():
         raise ValueError("SQL-пакеты содержат повторяющиеся visit_id между месячными разделами")
+    all_picos = pd.concat(picos_frames, ignore_index=True)
+    if not all_picos.empty and all_picos.duplicated(
+        ["YearMonth", "Ключ визита RTM"]
+    ).any():
+        raise ValueError("SQL-пакеты содержат повторяющиеся PICOS visit_id между месяцами")
     return (
         all_visits,
         pd.concat(agent_audits, ignore_index=True),
         pd.DataFrame(month_audits),
+        all_picos,
         set(archives),
     )
+
+
+def load_client_sql_visits(
+    export_root: Path,
+    dim_employees: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, set[int]]:
+    visits, agents, audit, _, months = load_client_sql_data(
+        export_root, dim_employees
+    )
+    return visits, agents, audit, months

@@ -3,9 +3,15 @@ import pandas as pd
 
 
 KPI_COMPONENT_COLUMNS = [
-    f"{metric} {value}"
-    for metric in ("PICOS", "OSA", "TOP16")
-    for value in ("план %", "факт %", "выполнение %")
+    "PICOS план",
+    "PICOS факт",
+    "PICOS выполнение %",
+    "OSA план %",
+    "OSA факт %",
+    "OSA выполнение %",
+    "TOP16 план %",
+    "TOP16 факт %",
+    "TOP16 выполнение %",
 ]
 KPI_PUBLIC_COLUMNS = ["KPI проекта %", *KPI_COMPONENT_COLUMNS]
 KPI_SCORE_WEIGHT_COLUMNS = [f"{metric} вес в KPI %" for metric in ("PICOS", "OSA", "TOP16")]

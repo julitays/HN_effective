@@ -3,7 +3,7 @@ import zipfile
 
 import pandas as pd
 
-from scripts.client_sql_exports import load_client_sql_visits
+from scripts.client_sql_exports import load_client_sql_data, load_client_sql_visits
 
 
 def _csv_bytes(frame: pd.DataFrame) -> bytes:
@@ -12,13 +12,25 @@ def _csv_bytes(frame: pd.DataFrame) -> bytes:
     return buffer.getvalue().encode("utf-8-sig")
 
 
-def _write_package(path) -> None:
+def _write_package(
+    path,
+    *,
+    year_month: int = 202607,
+    empty_picos: bool = False,
+    with_picos: bool = False,
+    manifest_diagnostics: bool = True,
+) -> None:
+    year = year_month // 100
+    month = year_month % 100
     frames = {
         "visits.csv": pd.DataFrame(
             {
                 "visit_id": ["V1", "V2"],
                 "aggregate_visit_id": ["A1", "A2"],
-                "visit_date": ["10.07.2026 0:00:00", "11.07.2026 0:00:00"],
+                "visit_date": [
+                    f"10.{month:02d}.{year} 0:00:00",
+                    f"11.{month:02d}.{year} 0:00:00",
+                ],
                 "store_id": ["100", "100"],
                 "agent_master_id": ["3001", "3002"],
             }
@@ -43,14 +55,18 @@ def _write_package(path) -> None:
             }
         ),
         "picos_by_visit.csv": pd.DataFrame(
-            columns=[
-                "visit_id",
-                "store_id",
-                "visit_date",
-                "picos_plan",
-                "picos_fact",
-                "picos_execution",
-            ]
+            {
+                "visit_id": ["V1", "V2"] if with_picos else [],
+                "store_id": ["100", "100"] if with_picos else [],
+                "visit_date": [
+                    f"10.{month:02d}.{year} 0:00:00",
+                    f"11.{month:02d}.{year} 0:00:00",
+                ] if with_picos else [],
+                "picos_potential": [100, 100] if with_picos else [],
+                "picos_plan": [80, 80] if with_picos else [],
+                "picos_fact": [90, 60] if with_picos else [],
+                "picos_execution": [1.0, 0.75] if with_picos else [],
+            }
         ),
         "osa_by_visit.csv": pd.DataFrame(
             columns=[
@@ -85,12 +101,14 @@ def _write_package(path) -> None:
         [
             {"file": name, "rows": len(frame), "status": "validated"}
             for name, frame in frames.items()
+            if manifest_diagnostics or name not in {"errors.csv", "warnings.csv"}
         ]
     )
     frames["manifest.csv"] = manifest
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, frame in frames.items():
-            archive.writestr(name, _csv_bytes(frame))
+            content = b"\xef\xbb\xbf" if empty_picos and name == "picos_by_visit.csv" else _csv_bytes(frame)
+            archive.writestr(name, content)
 
 
 def test_sql_visits_use_only_controlled_users_name_rules(tmp_path):
@@ -113,3 +131,53 @@ def test_sql_visits_use_only_controlled_users_name_rules(tmp_path):
     ]
     assert visits["Источник визитов"].unique().tolist() == ["SQL клиента"]
     assert audit.loc[0, "Покрытие сопоставления"] == 1.0
+
+
+def test_sql_package_accepts_empty_metric_partition(tmp_path):
+    package = tmp_path / "HN_KPI_202601.zip"
+    _write_package(package, year_month=202601, empty_picos=True)
+    dim = pd.DataFrame(
+        {
+            "ID сотрудника": ["E1", "E2"],
+            "ФИО": ["Иванов Иван Иванович", "Петров Петр Петрович"],
+        }
+    )
+
+    visits, _, _, months = load_client_sql_visits(tmp_path, dim)
+
+    assert months == {202601}
+    assert len(visits) == 2
+
+
+def test_sql_package_accepts_diagnostics_outside_manifest(tmp_path):
+    package = tmp_path / "HN_KPI_202607.zip"
+    _write_package(package, manifest_diagnostics=False)
+    dim = pd.DataFrame(
+        {
+            "ID сотрудника": ["E1", "E2"],
+            "ФИО": ["Иванов Иван Иванович", "Петров Петр Петрович"],
+        }
+    )
+
+    visits, _, _, months = load_client_sql_visits(tmp_path, dim)
+
+    assert months == {202607}
+    assert len(visits) == 2
+
+
+def test_sql_picos_uses_potential_and_project_threshold(tmp_path):
+    package = tmp_path / "HN_KPI_202607.zip"
+    _write_package(package, with_picos=True)
+    dim = pd.DataFrame(
+        {
+            "ID сотрудника": ["E1", "E2"],
+            "ФИО": ["Иванов Иван Иванович", "Петров Петр Петрович"],
+        }
+    )
+
+    _, _, _, picos, months = load_client_sql_data(tmp_path, dim)
+
+    assert months == {202607}
+    assert picos["PICOS план SQL"].tolist() == [80.0, 80.0]
+    assert picos["PICOS факт SQL"].tolist() == [90.0, 60.0]
+    assert picos["PICOS выполнение SQL %"].tolist() == [1.0, 0.75]

@@ -7,6 +7,7 @@ from scripts.parsers.kpi_parser import (
     _calculate_project_kpi,
     _canonical_kpi_name,
     _map_client_region,
+    _overlay_sql_picos,
     _valid_kpi_assignment,
 )
 
@@ -84,6 +85,85 @@ def test_client_region_prefers_source_and_falls_back_to_city():
     assert result.tolist() == ["Северо-Запад", "Москва"]
 
 
+def test_sql_picos_replaces_only_assigned_picos_without_fallback():
+    month = pd.Timestamp("2026-06-01")
+    tt_fact = pd.DataFrame(
+        [
+            {
+                "MonthStart": month,
+                "YearMonth": 202606,
+                "ТТ": store,
+                "Сеть": "CHAIN",
+                "Город": "CITY",
+                "Адрес": "ADDRESS",
+                "Регион BI": "Москва",
+                "Код маршрута СВ": "SV",
+                "KPI проекта %": 0.9,
+                "PICOS план": picos_plan,
+                "PICOS факт": picos_plan,
+                "PICOS выполнение %": picos_plan,
+                "OSA план %": osa_plan,
+                "OSA факт %": osa_plan,
+                "OSA выполнение %": osa_plan,
+                "TOP16 план %": pd.NA,
+                "TOP16 факт %": pd.NA,
+                "TOP16 выполнение %": pd.NA,
+            }
+            for store, picos_plan, osa_plan in [
+                ("PICOS_WITH_SQL", 0.9, pd.NA),
+                ("PICOS_WITHOUT_SQL", 0.9, pd.NA),
+                ("OSA_ONLY", pd.NA, 0.92),
+            ]
+        ]
+    )
+    tt_long = pd.DataFrame(
+        [
+            {
+                "MonthStart": month,
+                "YearMonth": 202606,
+                "ТТ": store,
+                "Сеть": "CHAIN",
+                "Город": "CITY",
+                "Адрес": "ADDRESS",
+                "Регион BI": "Москва",
+                "Метрика KPI": metric,
+                "Вес KPI": 1.0,
+                "План KPI": 0.9,
+                "Факт KPI": 0.9,
+                "Выполнение KPI %": 0.9,
+            }
+            for store, metric in [
+                ("PICOS_WITH_SQL", "PICOS"),
+                ("PICOS_WITHOUT_SQL", "PICOS"),
+                ("OSA_ONLY", "OSA"),
+            ]
+        ]
+    )
+    sql_picos = pd.DataFrame(
+        {
+            "MonthStart": [month, month],
+            "YearMonth": [202606, 202606],
+            "ТТ": ["PICOS_WITH_SQL", "OSA_ONLY"],
+            "PICOS план SQL": [800.0, 800.0],
+            "PICOS факт SQL": [600.0, 700.0],
+            "PICOS выполнение SQL %": [0.75, 0.875],
+        }
+    )
+
+    result, result_long = _overlay_sql_picos(
+        tt_fact, tt_long, sql_picos, {202606}
+    )
+    result = result.set_index("ТТ")
+
+    assert result.loc["PICOS_WITH_SQL", "PICOS план"] == 800.0
+    assert result.loc["PICOS_WITH_SQL", "KPI проекта %"] == 0.75
+    assert pd.isna(result.loc["PICOS_WITHOUT_SQL", "PICOS выполнение %"])
+    assert pd.isna(result.loc["PICOS_WITHOUT_SQL", "KPI проекта %"])
+    assert pd.isna(result.loc["OSA_ONLY", "PICOS выполнение %"])
+    assert result.loc["OSA_ONLY", "KPI проекта %"] == 0.92
+    assert set(result_long["Метрика KPI"]) == {"PICOS", "OSA"}
+
+
 def test_merch_fact_keeps_tm_name_and_id_from_the_same_dominant_territory():
     month = pd.Timestamp("2026-06-01")
     tt_fact = pd.DataFrame(
@@ -148,3 +228,68 @@ def test_merch_fact_keeps_tm_name_and_id_from_the_same_dominant_territory():
     assert pd.isna(result.loc[0, "ID территориального менеджера"])
     assert result.loc[0, "Супервайзер"] == "Supervisor A"
     assert result.loc[0, "Регион BI"] == "Москва"
+
+
+def test_merch_picos_uses_each_employees_own_sql_visits():
+    month = pd.Timestamp("2026-06-01")
+    tt_fact = pd.DataFrame(
+        [
+            {
+                "MonthStart": month,
+                "YearMonth": 202606,
+                "ТТ": "TT_SHARED",
+                "Сеть": "CHAIN",
+                "Город": "CITY",
+                "Код маршрута СВ": "SV",
+                "Регион BI": "Москва",
+                "_PICOS назначен": True,
+                "KPI проекта %": 0.875,
+                **{
+                    column: (
+                        0.875
+                        if column == "PICOS выполнение %"
+                        else 0.8
+                        if column == "PICOS план"
+                        else 0.7
+                        if column == "PICOS факт"
+                        else pd.NA
+                    )
+                    for column in KPI_VALUE_COLUMNS
+                },
+            }
+        ]
+    )
+    visits = pd.DataFrame(
+        [
+            {
+                "MonthStart": month,
+                "YearMonth": 202606,
+                "ТТ": "TT_SHARED",
+                "ID сотрудника": employee_id,
+                "Ключ визита RTM": visit_id,
+                "ФИО из логинов": employee_id,
+                "Логин": employee_id,
+                "ID супервайзера": "SV_ID",
+                "Супервайзер": "Supervisor",
+                "ID территориального менеджера": "TM_ID",
+                "Территориальный менеджер": "Manager",
+                "Регион BI": "Москва",
+                "PICOS план SQL": 800.0,
+                "PICOS факт SQL": fact,
+                "PICOS выполнение SQL %": execution,
+            }
+            for employee_id, visit_id, fact, execution in [
+                ("EMP_1", "V1", 900.0, 1.0),
+                ("EMP_2", "V2", 600.0, 0.75),
+            ]
+        ]
+    )
+
+    result = _build_merch_kpi_fact(
+        tt_fact, visits, pd.DataFrame()
+    ).set_index("ID мерчендайзера")
+
+    assert result.loc["EMP_1", "PICOS выполнение %"] == 1.0
+    assert result.loc["EMP_1", "KPI проекта %"] == 1.0
+    assert result.loc["EMP_2", "PICOS выполнение %"] == 0.75
+    assert result.loc["EMP_2", "KPI проекта %"] == 0.75
